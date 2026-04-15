@@ -164,3 +164,10 @@ aws cloudformation deploy \
   --stack-name flights-rds-stack \
   --parameter-overrides DBPassword=<your-password>
 ```
+
+**Nota importante**: 
+
+- `chmod +x download_data.sh` para dar permisos de ejecución
+- `./download_data.sh` para ejecutar el script
+
+Esta sección debe ser añadida después de la última línea del bloque CloudFormation de la sección "Infraestructura".

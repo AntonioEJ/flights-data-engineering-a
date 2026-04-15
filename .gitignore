@@ -3,5 +3,6 @@ data/
 __pycache__/
 .ipynb_checkpoints/
 *.parquet
+*.zip
 .env
 .DS_Store
