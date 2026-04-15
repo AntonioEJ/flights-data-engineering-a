@@ -92,6 +92,9 @@ lights-data-engineering-a/
 │ └── init.py
 └── tests/ → Unit tests y data quality checks
 └── init.py
+```
+
+---
 
 ## ⚙️ Pipeline ETL
 
@@ -121,6 +124,8 @@ lights-data-engineering-a/
   - **Métricas temporales**: tendencias mensuales, día de la semana.
   - **Métricas por ruta**: pares origen-destino más frecuentes.
 - Escribe cada tabla en formato **Parquet** en `s3://<bucket>/gold/`.
+
+---
 
 ### Buenas Prácticas Implementadas
 
@@ -163,4 +168,31 @@ aws cloudformation deploy \
   --template-file infra/rds-flights.yaml \
   --stack-name flights-rds-stack \
   --parameter-overrides DBPassword=<your-password>
+```
+
+**Nota importante**: 
+
+- `chmod +x download_data.sh` para dar permisos de ejecución
+- `./download_data.sh` para ejecutar el script
+
+Esta sección debe ser añadida después de la última línea del bloque CloudFormation de la sección "Infraestructura".
+
+---
+
+## Scripts de Ejecución
+
+| Script | Responsabilidad |
+|--------|----------------|
+| `etl/bronze.py` | Sube los tres CSVs a S3 y los registra en Glue |
+| `etl/silver.py` | Transforma a Parquet + Snappy y construye las tres agregaciones |
+| `etl/gold.py` | Ejecuta el CTAS en Athena para construir la tabla analítica |
+
+### Ejecución desde Terminal
+
+Ejecuta los scripts en orden desde el terminal de SageMaker Jupyter Lab:
+
+```bash
+python etl/bronze.py --bucket <tu-bucket> --data-dir data/
+python etl/silver.py --bucket <tu-bucket>
+python etl/gold.py --bucket <tu-bucket>
 ```
