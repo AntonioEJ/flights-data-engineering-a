@@ -8,9 +8,8 @@
 
 ## 👥 Autores
 
-
-José Antonio Esparza
-Gustavo Pardo 
+- José Antonio Esparza
+- Gustavo Pardo 
 
 ---
 
