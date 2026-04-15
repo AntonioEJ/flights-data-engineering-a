@@ -8,9 +8,9 @@
 
 ## 👥 Autores
 
-|---|
-| José Antonio Esparza |
-| Gustavo Pardo |
+
+José Antonio Esparza
+Gustavo Pardo 
 
 ---
 
@@ -36,7 +36,6 @@ El diseño sigue la **arquitectura Medallion** (Bronze → Silver → Gold) sobr
 
 ### Arquitectura Medallion
 ```
-
 | Capa | Propósito | Formato | Ubicación S3 |
 |---|---|---|---|
 | **Bronze** | Ingestión cruda sin transformaciones. Copia fiel del CSV original. | CSV | `s3://<bucket>/bronze/` |
@@ -44,9 +43,8 @@ El diseño sigue la **arquitectura Medallion** (Bronze → Silver → Gold) sobr
 | **Gold** | Agregaciones de negocio: métricas por aerolínea, aeropuerto, rutas y temporalidad. | Parquet | `s3://<bucket>/gold/` |
 
 ### Flujo de Datos End-to-End
-````
-This is the code block that represents the suggested code change:
-```markdown
+```
+
 ---
 
 ## 🛠️ Tecnologías Utilizadas
@@ -69,22 +67,32 @@ This is the code block that represents the suggested code change:
 ---
 
 ## 📁 Estructura del Repositorio
-`````
-This is the code block that represents the suggested code change:
-````markdown
-### Descripción de Carpetas
-
-| Carpeta | Propósito |
-|---|---|
-| `etl/` | Contiene los tres scripts del pipeline Medallion. Cada script es idempotente y puede ejecutarse de forma independiente. |
-| `notebooks/` | Jupyter Notebook con análisis exploratorio, visualizaciones y modelos predictivos. |
-| `infra/` | Templates de CloudFormation para aprovisionar la infraestructura de base de datos en AWS. |
-| `docs/` | Diagramas del modelo relacional y capturas de pantalla como evidencia de ejecución. |
-| `src/` | Módulos auxiliares reutilizables: conexión a S3, conexión a PostgreSQL, helpers. |
-| `config/` | Configuración centralizada: rutas de S3, parámetros de conexión, constantes. |
-| `tests/` | Tests unitarios básicos para validar cada capa del pipeline. |
-
----
+```
+lights-data-engineering-a/
+├── artifacts/ → Screenshots de evidencia para evaluación académica
+│ └── screenshots/
+├── config/ → Variables AWS, credenciales y conexiones PostgreSQL
+│ └── init.py
+├── db/ → DDL scripts y esquemas del modelo relacional
+├── docs/ → Diagrama ER y documentación técnica
+│ ├── erd-flights.drawio
+│ ├── erd-flights.png
+│ └── screenshots/
+├── etl/ → Pipeline Medallion (Bronze → Silver → Gold)
+│ ├── bronze.py
+│ ├── gold.py
+│ └── silver.py
+├── infra/ → CloudFormation templates para RDS PostgreSQL
+│ └── rds-flights.yaml
+├── notebooks/ → EDA, regresión lineal y forecasting
+│ └── flights_analytics.ipynb
+├── README.md
+├── requirements.txt
+├── sql/ → CREATE TABLE statements y analytical queries
+├── src/ → Utilities: S3 client, PostgreSQL connector, validators
+│ └── init.py
+└── tests/ → Unit tests y data quality checks
+└── init.py
 
 ## ⚙️ Pipeline ETL
 
@@ -144,8 +152,8 @@ El modelo relacional está diseñado en **tercera forma normal (3NF)** y despleg
 
 El diagrama ER se encuentra en:
 
-- **Imagen**: `docs/erd-flights.png`
-- **Editable**: `docs/erd-flights.drawio`
+- **Imagen**: [docs/erd-flights.png](docs/erd-flights.png)
+- **Editable**: [docs/erd-flights.drawio](docs/erd-flights.drawio)
 
 ### Infraestructura
 
