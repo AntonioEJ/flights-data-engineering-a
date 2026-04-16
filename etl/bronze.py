@@ -53,16 +53,16 @@ S3_BRONZE_PATH_TEMPLATE: str = "s3://{bucket}/flights/bronze/{table}/"
 """str: S3 URI template. Placeholders: ``{bucket}`` and ``{table}``."""
 
 FLIGHTS_DTYPES: Dict[str, str] = {
-    "YEAR": "Int16",
-    "MONTH": "Int8",
-    "DAY": "Int8",
-    "DAY_OF_WEEK": "Int8",
+    "YEAR": "int16",
+    "MONTH": "int8", 
+    "DAY": "int8",
+    "DAY_OF_WEEK": "int8",
     "AIRLINE": "category",
-    "FLIGHT_NUMBER": "Int32",
+    "FLIGHT_NUMBER": "int32",
     "TAIL_NUMBER": "str",
-    "ORIGIN_AIRPORT": "category",
+    "ORIGIN_AIRPORT": "category", 
     "DESTINATION_AIRPORT": "category",
-    "SCHEDULED_DEPARTURE": "Int32",
+    "SCHEDULED_DEPARTURE": "int32",
     "DEPARTURE_TIME": "float32",
     "DEPARTURE_DELAY": "float32",
     "TAXI_OUT": "float32",
@@ -73,11 +73,11 @@ FLIGHTS_DTYPES: Dict[str, str] = {
     "DISTANCE": "float32",
     "WHEELS_ON": "float32",
     "TAXI_IN": "float32",
-    "SCHEDULED_ARRIVAL": "Int32",
+    "SCHEDULED_ARRIVAL": "int32",
     "ARRIVAL_TIME": "float32",
     "ARRIVAL_DELAY": "float32",
-    "DIVERTED": "Int8",
-    "CANCELLED": "Int8",
+    "DIVERTED": "int8",
+    "CANCELLED": "int8",
     "CANCELLATION_REASON": "category",
     "AIR_SYSTEM_DELAY": "float32",
     "SECURITY_DELAY": "float32",
@@ -205,19 +205,15 @@ def extract(data_dir: str) -> Dict[str, pd.DataFrame]:
             kwargs = {
                 "filepath_or_buffer": file_path,
                 "engine": "c",
+                "low_memory": False,  # Ensure compatibility with c engine
             }
-            if table_name == "flights":
-                kwargs["dtype"] = FLIGHTS_DTYPES
-
-            # Guard: ensure no incompatible options are passed to c engine
-            incompatible_with_c = {"memory_map"}
-            invalid_keys = incompatible_with_c & set(kwargs.keys())
-            if invalid_keys:
-                raise ValueError(
-                    f"Options {invalid_keys} are not supported with engine='c'"
-                )
-
+            
             df = pd.read_csv(**kwargs)
+            
+            # Apply dtype conversions after loading for flights table
+            if table_name == "flights":
+                df = df.astype(FLIGHTS_DTYPES)
+                
             data[table_name] = df
             logger.info(
                 "✓ Read %s: %d rows, %d columns",  # fix W1203
