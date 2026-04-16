@@ -34,14 +34,98 @@ El diseño sigue la **arquitectura Medallion** (Bronze → Silver → Gold) sobr
 ## 🏗️ Arquitectura del Proyecto
 
 ### Arquitectura Medallion
-```
-| Capa | Propósito | Formato | Ubicación S3 |
-|---|---|---|---|
-| **Bronze** | Ingestión cruda sin transformaciones. Copia fiel del CSV original. | CSV | `s3://<bucket>/bronze/` |
-| **Silver** | Limpieza, tipado, eliminación de nulos, estandarización de columnas. | Parquet | `s3://<bucket>/silver/` |
-| **Gold** | Agregaciones de negocio: métricas por aerolínea, aeropuerto, rutas y temporalidad. | Parquet | `s3://<bucket>/gold/` |
 
-### Flujo de Datos End-to-End
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          MEDALLION ARCHITECTURE                                 │
+│                                                                                 │
+│  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐                  │
+│  │              │      │              │      │              │                  │
+│  │   🥉 BRONZE  │─────▶│   🥈 SILVER  │─────▶│   🥇 GOLD    │                  │
+│  │              │      │              │      │              │                  │
+│  └──────┬───────┘      └──────┬───────┘      └──────┬───────┘                  │
+│         │                     │                     │                          │
+│    Raw Ingestion         Aggregations          Denormalized                    │
+│    CSV → Parquet         Business KPIs         Analytical Table                │
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │                        AWS SERVICES                                      │   │
+│  │  S3 (Storage)  ·  Glue (Catalog)  ·  Athena (Query)  ·  RDS (RDBMS)    │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 🥉 Bronze — Ingestión Cruda
+
+| Aspecto | Detalle |
+|---|---|
+| **Propósito** | Copia fiel del dataset original sin transformaciones |
+| **Formato** | Parquet (convertido desde CSV) |
+| **Tablas** | `flights` · `airlines` · `airports` |
+| **S3** | `s3://<bucket>/flights/bronze/{tabla}/` |
+| **Glue DB** | `flights_bronze` |
+| **Script** | `etl/bronze.py` |
+
+```
+CSV (local)  ──▶  Validate  ──▶  Parquet (S3)  ──▶  Glue Catalog
+```
+
+#### 🥈 Silver — Agregaciones de Negocio
+
+| Aspecto | Detalle |
+|---|---|
+| **Propósito** | Métricas agregadas por día, mes/aerolínea y aeropuerto |
+| **Formato** | Parquet + Snappy |
+| **S3** | `s3://<bucket>/flights/silver/{tabla}/` |
+| **Glue DB** | `flights_silver` |
+| **Script** | `etl/silver.py` |
+
+| Tabla Silver | Agrupación | Métricas |
+|---|---|---|
+| `flights_daily` | YEAR, MONTH, DAY | total_flights, total_delayed, total_cancelled, avg_departure_delay, avg_arrival_delay |
+| `flights_monthly` | MONTH, AIRLINE | total_flights, total_delayed, total_cancelled, avg_arrival_delay, on_time_pct |
+| `flights_by_airport` | ORIGIN_AIRPORT | total_departures, total_delayed, total_cancelled, avg_departure_delay, pct_weather_delay |
+
+```
+Bronze (S3 Parquet)  ──file-by-file──▶  Partial Aggs  ──combine──▶  Silver (S3 + Glue)
+```
+
+#### 🥇 Gold — Tabla Analítica Desnormalizada
+
+| Aspecto | Detalle |
+|---|---|
+| **Propósito** | Vista desnormalizada lista para consumo analítico |
+| **Método** | CTAS ejecutado en Athena (JOINs sobre Bronze) |
+| **Tabla** | `vuelos_analitica` (~5.8M filas, 20 columnas) |
+| **S3** | `s3://<bucket>/flights/gold/` |
+| **Glue DB** | `flights_gold` |
+| **Script** | `etl/gold.py` |
+
+```
+Bronze tables (Glue)  ──CTAS (Athena)──▶  Gold analytical table (S3 + Glue)
+
+  flights ──┐
+  airlines ─┤── LEFT JOINs ──▶  vuelos_analitica
+  airports ─┘
+```
+
+> **Nota:** El CTAS se construye sobre Bronze para demostrar que Gold puede
+> construirse desde cualquier capa. En producción se construiría desde Silver
+> para aprovechar el Parquet ya procesado.
+
+#### Flujo End-to-End
+
+```
+  download_data.sh          bronze.py              silver.py               gold.py
+  ┌──────────┐        ┌──────────────┐       ┌──────────────┐       ┌──────────────┐
+  │ Download │──CSV──▶│  Ingest Raw  │──S3──▶│  Aggregate   │──S3──▶│  CTAS Join   │
+  │   CSVs   │        │  to Parquet  │       │  KPIs        │       │  Denormalize │
+  └──────────┘        └──────┬───────┘       └──────┬───────┘       └──────┬───────┘
+                             │                      │                      │
+                        Glue: flights_bronze   Glue: flights_silver   Glue: flights_gold
+                        ├─ flights             ├─ flights_daily       └─ vuelos_analitica
+                        ├─ airlines            ├─ flights_monthly
+                        └─ airports            └─ flights_by_airport
 ```
 
 ---
@@ -67,69 +151,96 @@ El diseño sigue la **arquitectura Medallion** (Bronze → Silver → Gold) sobr
 
 ## 📁 Estructura del Repositorio
 ```
-lights-data-engineering-a/
-├── artifacts/ → Screenshots de evidencia para evaluación académica
-│ └── screenshots/
-├── config/ → Variables AWS, credenciales y conexiones PostgreSQL
-│ └── init.py
-├── db/ → DDL scripts y esquemas del modelo relacional
-├── docs/ → Diagrama ER y documentación técnica
-│ ├── erd-flights.drawio
-│ ├── erd-flights.png
-│ └── screenshots/
-├── etl/ → Pipeline Medallion (Bronze → Silver → Gold)
-│ ├── bronze.py
-│ ├── gold.py
-│ └── silver.py
-├── infra/ → CloudFormation templates para RDS PostgreSQL
-│ └── rds-flights.yaml
-├── notebooks/ → EDA, regresión lineal y forecasting
-│ └── flights_analytics.ipynb
+flights-data-engineering-a/
+├── config/                → Variables AWS, credenciales y conexiones
+│   └── __init__.py
+├── data/                  → Datos crudos descargados (no versionados)
+│   └── flights/
+│       ├── flights.csv
+│       ├── airlines.csv
+│       └── airports.csv
+├── db/                    → DDL scripts y esquemas del modelo relacional
+├── docs/                  → Diagrama ER y documentación técnica
+│   ├── erd-flights.drawio
+│   ├── erd-flights.png
+│   └── screenshots/
+├── etl/                   → Pipeline Medallion (Bronze → Silver → Gold)
+│   ├── bronze.py
+│   ├── silver.py
+│   └── gold.py
+├── infra/                 → CloudFormation templates para RDS PostgreSQL
+│   └── rds-flights.yaml
+├── logs/                  → Logs de ejecución ETL (generados automáticamente)
+│   ├── bronze_etl.log
+│   ├── silver_etl.log
+│   └── gold_etl.log
+├── notebooks/             → EDA, regresión lineal y forecasting
+│   └── flights_analytics.ipynb
+├── sql/                   → CREATE TABLE statements y analytical queries
+├── src/                   → Utilities: S3 client, PostgreSQL connector
+│   └── __init__.py
+├── tests/                 → Unit tests y data quality checks
+│   └── __init__.py
+├── .gitignore
+├── .pylintrc
+├── download_data.sh       → Descarga los CSVs del dataset
 ├── README.md
-├── requirements.txt
-├── sql/ → CREATE TABLE statements y analytical queries
-├── src/ → Utilities: S3 client, PostgreSQL connector, validators
-│ └── init.py
-└── tests/ → Unit tests y data quality checks
-└── init.py
+└── requirements.txt
+```
+
+---
 
 ## ⚙️ Pipeline ETL
 
-### Bronze — Ingestión (`etl/bronze.py`)
+### Bronze — `etl/bronze.py`
 
-- Lee el archivo CSV original del dataset de vuelos.
-- Lo sube tal cual a `s3://<bucket>/bronze/flights.csv`.
-- No aplica ninguna transformación; preserva el dato crudo.
-- Registra logs de tamaño del archivo y tiempo de carga.
+```bash
+python etl/bronze.py --bucket <tu-bucket> --data-dir data/flights/
+```
 
-### Silver — Transformación (`etl/silver.py`)
+- Lee los 3 archivos CSV originales (`flights.csv`, `airlines.csv`, `airports.csv`).
+- Convierte a Parquet y sube a `s3://<bucket>/flights/bronze/{tabla}/`.
+- `flights.csv` (~5.8M filas) se procesa en chunks de 500K filas para evitar OOM.
+- Registra las tablas en Glue Data Catalog (`flights_bronze`).
 
-- Lee el CSV desde la capa Bronze en S3.
-- Aplica las siguientes transformaciones:
-  - Eliminación de filas con valores nulos críticos.
-  - Conversión de tipos de dato (fechas, enteros, flotantes).
-  - Estandarización de nombres de columnas (`snake_case`).
-  - Eliminación de columnas redundantes o sin valor analítico.
-- Escribe el resultado en formato **Parquet** en `s3://<bucket>/silver/flights.parquet`.
+### Silver — `etl/silver.py`
 
-### Gold — Agregación (`etl/gold.py`)
+```bash
+python etl/silver.py --bucket <tu-bucket>
+```
 
-- Lee los datos limpios desde la capa Silver.
-- Genera tablas agregadas orientadas al negocio:
-  - **Métricas por aerolínea**: total de vuelos, retrasos promedio, tasa de cancelación.
-  - **Métricas por aeropuerto**: tráfico de origen/destino, retrasos promedio.
-  - **Métricas temporales**: tendencias mensuales, día de la semana.
-  - **Métricas por ruta**: pares origen-destino más frecuentes.
-- Escribe cada tabla en formato **Parquet** en `s3://<bucket>/gold/`.
+- Lee Bronze archivo por archivo (sin Ray) con solo las columnas necesarias.
+- Computa agregaciones parciales por chunk y las combina al final.
+- Genera 3 tablas Silver: `flights_daily`, `flights_monthly`, `flights_by_airport`.
+- `flights_daily` particionada por `MONTH` (`overwrite_partitions`).
+- Todas registradas en Glue Data Catalog (`flights_silver`).
+
+### Gold — `etl/gold.py`
+
+```bash
+python etl/gold.py --bucket <tu-bucket>
+```
+
+- Verifica que las tablas Bronze existan en Glue.
+- Ejecuta un CTAS en Athena que une `flights` + `airlines` + `airports`.
+- Genera la tabla desnormalizada `vuelos_analitica` (20 columnas).
+- Valida que `airline_name`, `origin_airport_name` y `destination_airport_name` estén poblados.
+
+---
 
 ### Buenas Prácticas Implementadas
 
-| Práctica | Descripción |
+| Práctica | Implementación |
 |---|---|
-| **Idempotencia** | Cada script puede ejecutarse múltiples veces sin duplicar datos (sobrescritura controlada). |
-| **Logging** | Uso de `logging` para registrar progreso, errores y métricas de ejecución. |
-| **Modularidad** | Funciones atómicas y reutilizables en `src/`. Cada capa es independiente. |
-| **Separación de configuración** | Parámetros externalizados en `config/settings.py`. |
+| **Idempotencia** | Bronze: `overwrite` / `append` por chunks. Silver: `overwrite_partitions` y `overwrite`. Gold: `delete_table_if_exists` + limpieza S3 antes de CTAS. |
+| **Memory-safe** | Bronze: chunks de 500K filas. Silver: lectura file-by-file, solo 15 columnas, `gc.collect()`. Gold: Athena ejecuta el CTAS (sin carga en RAM). |
+| **Logging profesional** | Módulo `logging` con handlers a consola + archivo (`logs/{capa}_etl.log`). Timestamps, fases claramente delimitadas, cifras de control al final. |
+| **Manejo de errores** | `try/except` en cada fase con `logger.exception()` + `raise`. `main()` captura todo y hace `sys.exit(1)`. |
+| **Docstrings** | Todas las funciones documentadas con descripción, `Args`, `Returns` y `Raises`. |
+| **Modularidad** | Patrón `extract → transform → load → main` en cada script. Funciones con responsabilidad única. |
+| **Cifras de control** | Cada script imprime al final: filas procesadas, tablas generadas, tiempos por fase. |
+| **CLI** | `argparse` con `--bucket` (y `--data-dir` en Bronze). Ayuda con `--help`. |
+| **Pylint** | Bronze: 9.38/10. Silver: 9.49/10. Gold: 9.40/10. |
 
 ---
 
@@ -170,4 +281,63 @@ aws cloudformation deploy \
 - `chmod +x download_data.sh` para dar permisos de ejecución
 - `./download_data.sh` para ejecutar el script
 
-Esta sección debe ser añadida después de la última línea del bloque CloudFormation de la sección "Infraestructura".
+---
+
+## 🚀 Ejecución Completa
+
+### Prerequisitos
+
+1. Ambiente **SageMaker Studio** con acceso a S3, Glue y Athena.
+2. Dataset descargado en `data/flights/` (ver `download_data.sh`).
+3. Dependencias instaladas:
+
+```bash
+pip install -r requirements.txt
+```
+
+### Pipeline — Ejecutar en Orden
+
+```bash
+# 1. Bronze — CSV → Parquet → S3 + Glue
+python etl/bronze.py --bucket itam-analytics-antonio --data-dir data/flights/
+
+# 2. Silver — Agregaciones de negocio
+python etl/silver.py --bucket itam-analytics-antonio
+
+# 3. Gold — CTAS desnormalizado en Athena
+python etl/gold.py --bucket itam-analytics-antonio
+```
+
+> Cada script depende del anterior: Bronze debe completarse antes de Silver,
+> y Bronze antes de Gold.
+
+### Logs Generados
+
+Cada ejecución genera un archivo de log con cifras de control:
+
+| Log | Contenido |
+|---|---|
+| `logs/bronze_etl.log` | Filas por tabla, chunks procesados, tiempos |
+| `logs/silver_etl.log` | Filas Bronze leídas, archivos Parquet, filas/cols por tabla Silver, tiempos |
+| `logs/gold_etl.log` | Tabla creada, filas totales, validación de JOINs, tiempos |
+
+### Ejemplo de Cifras de Control (Silver)
+
+```
+========================================================================
+  CIFRAS DE CONTROL
+------------------------------------------------------------------------
+  Bronze filas leídas       : 5,819,079
+  Archivos Parquet leídos   : 12
+------------------------------------------------------------------------
+  flights_daily             :    365 filas,  8 cols
+  flights_monthly           :    168 filas,  7 cols
+  flights_by_airport        :    322 filas,  6 cols
+------------------------------------------------------------------------
+  Extract + Transform       : 42.3 s
+  Load                      :  8.1 s
+  Total                     : 50.4 s
+========================================================================
+  ✓ SILVER LAYER COMPLETED SUCCESSFULLY
+========================================================================
+```
