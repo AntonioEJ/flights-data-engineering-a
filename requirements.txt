@@ -25,3 +25,6 @@ pylint>=2.16.0
 
 # Utilities
 python-dotenv>=1.0.0
+
+# Additional Dependencies
+pyarrow>=12.0.0
