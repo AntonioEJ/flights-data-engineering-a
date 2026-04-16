@@ -52,6 +52,9 @@ GLUE_DATABASE: str = "flights_bronze"
 S3_BRONZE_PATH_TEMPLATE: str = "s3://{bucket}/flights/bronze/{table}/"
 """str: S3 URI template. Placeholders: ``{bucket}`` and ``{table}``."""
 
+CHUNK_SIZE: int = 500_000
+"""int: Number of rows per chunk when reading large CSV files."""
+
 FLIGHTS_DTYPES: Dict[str, str] = {
     "YEAR": "int16",
     "MONTH": "int8", 
@@ -170,17 +173,18 @@ def validate_file_path(file_path: str) -> None:
 
 
 def extract(data_dir: str) -> Dict[str, pd.DataFrame]:
-    """Read all source CSV files from a local directory.
+    """Read small CSV files from a local directory (excludes flights).
 
-    Iterates over :pydata:`CSV_FILES`, reads each CSV into a
-    ``pandas.DataFrame``, and returns them keyed by table name.
+    Reads ``airlines.csv`` and ``airports.csv`` into memory.
+    The large ``flights.csv`` is handled separately by
+    :func:`extract_and_load_flights` using chunked processing.
 
     Args:
         data_dir (str): Path to the directory that contains the CSV files.
 
     Returns:
-        Dict[str, pd.DataFrame]: Dictionary mapping each table name
-        (``flights``, ``airlines``, ``airports``) to its DataFrame.
+        Dict[str, pd.DataFrame]: Dictionary mapping each small table name
+        (``airlines``, ``airports``) to its DataFrame.
 
     Raises:
         FileNotFoundError: If any expected CSV file is missing.
@@ -189,25 +193,21 @@ def extract(data_dir: str) -> Dict[str, pd.DataFrame]:
     Example:
         >>> data = extract("data/")
         >>> data.keys()
-        dict_keys(['flights', 'airlines', 'airports'])
+        dict_keys(['airlines', 'airports'])
     """
     logger.info("=" * 80)
-    logger.info("STARTING EXTRACT PHASE")
+    logger.info("STARTING EXTRACT PHASE (small tables)")
     logger.info("=" * 80)
 
     data: Dict[str, pd.DataFrame] = {}
     for table_name, filename in CSV_FILES.items():
+        if table_name == "flights":
+            continue  # handled by extract_and_load_flights
         file_path = os.path.join(data_dir, filename)
         try:
             logger.info("Reading file: %s", file_path)  # fix W1203
             validate_file_path(file_path)
-
-            kwargs = {
-                "filepath_or_buffer": file_path,
-                "engine": "c",
-            }
-
-            df = pd.read_csv(**kwargs)
+            df = pd.read_csv(file_path, engine="c")
             data[table_name] = df
             logger.info(
                 "✓ Read %s: %d rows, %d columns",  # fix W1203
@@ -218,9 +218,70 @@ def extract(data_dir: str) -> Dict[str, pd.DataFrame]:
             raise
 
     logger.info("=" * 80)
-    logger.info("EXTRACT PHASE COMPLETED")
+    logger.info("EXTRACT PHASE COMPLETED (small tables)")
     logger.info("=" * 80)
     return data
+
+
+def extract_and_load_flights(
+    data_dir: str, bucket: str, database: str = GLUE_DATABASE
+) -> int:
+    """Read flights.csv in chunks and upload each chunk to S3 as Parquet.
+
+    Processes the large flights file in batches of :pydata:`CHUNK_SIZE`
+    rows to avoid exceeding available memory.  The first chunk uses
+    ``mode='overwrite'`` to replace any previous data; subsequent chunks
+    use ``mode='append'``.
+
+    Args:
+        data_dir (str): Path to the directory that contains ``flights.csv``.
+        bucket (str): Target S3 bucket name.
+        database (str, optional): Glue database name.
+            Defaults to :pydata:`GLUE_DATABASE`.
+
+    Returns:
+        int: Total number of rows processed.
+
+    Raises:
+        FileNotFoundError: If ``flights.csv`` is missing.
+        botocore.exceptions.ClientError: If the S3/Glue API call fails.
+
+    Example:
+        >>> total = extract_and_load_flights("data/", "my-bucket")
+        >>> total
+        5819811
+    """
+    file_path = os.path.join(data_dir, CSV_FILES["flights"])
+    validate_file_path(file_path)
+
+    s3_path = S3_BRONZE_PATH_TEMPLATE.format(bucket=bucket, table="flights")
+    logger.info("Processing flights.csv in chunks of %d rows", CHUNK_SIZE)
+    logger.info("Target S3 path: %s", s3_path)
+
+    total_rows = 0
+    chunks = pd.read_csv(file_path, engine="c", chunksize=CHUNK_SIZE)
+
+    for i, chunk in enumerate(chunks):
+        chunk.columns = chunk.columns.str.upper()
+        mode = "overwrite" if i == 0 else "append"
+        wr.s3.to_parquet(
+            df=chunk,
+            path=s3_path,
+            dataset=True,
+            database=database,
+            table="flights",
+            mode=mode,
+            compression="snappy",
+        )
+        total_rows += len(chunk)
+        logger.info(
+            "✓ Chunk %d uploaded: %d rows (total: %d)",
+            i + 1, len(chunk), total_rows
+        )
+        del chunk  # free memory immediately
+
+    logger.info("✓ flights table loaded with %d total rows", total_rows)
+    return total_rows
 
 
 # ---------------------------------------------------------------------------
@@ -379,19 +440,13 @@ def load(
     try:
         create_glue_database(database)
 
-        small_tables = {k: v for k, v in data.items() if k != "flights"}
-        large_tables = {k: v for k, v in data.items() if k == "flights"}
-
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {
                 executor.submit(upload_to_s3, df, name, bucket, database): name
-                for name, df in small_tables.items()
+                for name, df in data.items()
             }
             for future in as_completed(futures):
                 future.result()
-
-        for table_name, df in large_tables.items():
-            upload_to_s3(df, table_name, bucket, database)
 
         logger.info("=" * 80)
         logger.info("LOAD PHASE COMPLETED")
@@ -424,11 +479,9 @@ def main(bucket: str, data_dir: str) -> None:
         >>> main(bucket="my-bucket", data_dir="data/")
     """
     try:
-        logger.info("\n" + "╔" + "=" * 78 + "╗")
-        logger.info(
-            "║" + " " * 20 + "FLIGHTS BRONZE LAYER ETL PIPELINE" + " " * 24 + "║"
-        )
-        logger.info("╚" + "=" * 78 + "╝")
+        logger.info("\n╔%s╗", "=" * 78)
+        logger.info("║%sFLIGHTS BRONZE LAYER ETL PIPELINE%s║", " " * 20, " " * 24)
+        logger.info("╚%s╝", "=" * 78)
         logger.info("Bucket: %s", bucket)          # fix W1203
         logger.info("Data Directory: %s\n", data_dir)  # fix W1203
 
@@ -442,15 +495,20 @@ def main(bucket: str, data_dir: str) -> None:
             raise FileNotFoundError(f"Data directory not found: {data_dir}")
         logger.info("✓ Data directory exists\n")
 
+        # --- Small tables (airlines, airports): full in-memory pipeline ---
         raw_data = extract(data_dir)
         transformed_data = transform(raw_data)
         load(transformed_data, bucket)
 
-        logger.info("\n" + "╔" + "=" * 78 + "╗")
-        logger.info(
-            "║" + " " * 25 + "✓ BRONZE LAYER COMPLETED" + " " * 29 + "║"
-        )
-        logger.info("╚" + "=" * 78 + "╝\n")
+        # --- Flights: chunked read → upload to avoid OOM ---
+        logger.info("=" * 80)
+        logger.info("STARTING CHUNKED FLIGHTS PROCESSING")
+        logger.info("=" * 80)
+        extract_and_load_flights(data_dir, bucket)
+
+        logger.info("\n╔%s╗", "=" * 78)
+        logger.info("║%s✓ BRONZE LAYER COMPLETED%s║", " " * 25, " " * 29)
+        logger.info("╚%s╝\n", "=" * 78)
 
     except Exception:  # pylint: disable=broad-exception-caught
         logger.exception("Bronze layer ETL pipeline failed")
