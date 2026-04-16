@@ -3,16 +3,16 @@
 Silver Layer ETL Script
 =======================
 
-Read raw Parquet data from the Bronze layer in S3, apply business-level
-aggregations, and write the resulting tables back to S3 as Parquet
-registered in AWS Glue Data Catalog.
+Read raw Parquet data from the Bronze layer in S3 **in chunks**,
+compute business-level aggregations incrementally, and write the
+resulting tables back to S3 as Parquet registered in AWS Glue.
 
 This module implements the **Silver layer** of the Medallion
 architecture for the U.S. Domestic Flights 2015 dataset.
 
 Pipeline flow::
 
-    Bronze (S3 Parquet) ──▶ Aggregate ──▶ Silver (S3 Parquet) ──▶ Glue
+    Bronze (S3 Parquet)  ─chunk─▶  partial aggs  ─combine─▶  Silver (S3)
 
 Tables produced:
     * ``flights_daily``      — daily flight statistics.
@@ -24,11 +24,12 @@ Usage::
     python etl/silver.py --bucket <tu-bucket>
 
 Design decisions:
+    * **Memory-safe**: Bronze data is read in chunks of ``CHUNK_SIZE``
+      rows.  Each chunk produces small partial aggregations that are
+      combined after all chunks have been processed.
     * **Idempotent**: Glue DB created idempotently; ``flights_daily``
       uses ``overwrite_partitions`` (partitioned by MONTH);
       remaining tables use ``mode='overwrite'``.
-    * **Memory-safe**: reads Bronze data from S3 (already Parquet),
-      aggregations reduce row count dramatically.
     * **Fail-loud**: every critical step is wrapped in ``try/except``
       with ``logger.exception`` and ``sys.exit(1)``.
 
@@ -41,6 +42,7 @@ Date:
 
 import sys
 import os
+import time
 import logging
 import argparse
 from typing import Dict, List
@@ -60,6 +62,9 @@ S3_BRONZE_PREFIX: str = "s3://{bucket}/flights/bronze/flights/"
 
 S3_SILVER_PREFIX: str = "s3://{bucket}/flights/silver/{table}/"
 """S3 path template for Silver output tables."""
+
+CHUNK_SIZE: int = 500_000
+"""Number of rows per chunk when reading Bronze flights from S3."""
 
 # Pre-write validation: columns that must exist in each Silver table.
 REQUIRED_COLUMNS: Dict[str, List[str]] = {
@@ -145,272 +150,277 @@ def validate_dataframe(df: pd.DataFrame, table_name: str) -> None:
                 table_name, df.shape[0], df.shape[1])
 
 
-# ── Extract ──────────────────────────────────────────────────────────────────
+# ── Extract + Transform (chunked) ────────────────────────────────────────────
 
-def extract(bucket: str) -> pd.DataFrame:
-    """Read the ``flights`` table from the Bronze layer in S3.
+BRONZE_REQUIRED_COLS: List[str] = [
+    "YEAR", "MONTH", "DAY", "AIRLINE", "ORIGIN_AIRPORT",
+    "DESTINATION_AIRPORT", "DEPARTURE_DELAY", "ARRIVAL_DELAY",
+    "CANCELLED", "WEATHER_DELAY", "AIR_SYSTEM_DELAY",
+    "SECURITY_DELAY", "AIRLINE_DELAY", "LATE_AIRCRAFT_DELAY",
+    "FLIGHT_NUMBER",
+]
+"""Columns required in Bronze flights for Silver aggregations."""
+
+DELAY_COLS: List[str] = [
+    "AIR_SYSTEM_DELAY", "SECURITY_DELAY", "AIRLINE_DELAY",
+    "LATE_AIRCRAFT_DELAY", "WEATHER_DELAY",
+]
+"""All delay-cause columns used for PCT_WEATHER_DELAY computation."""
+
+
+def _partial_daily(chunk: pd.DataFrame) -> pd.DataFrame:
+    """Compute partial daily aggregation for a single chunk.
+
+    Stores raw counts and sums so that means can be computed after
+    all chunks are combined.
 
     Args:
-        bucket: S3 bucket name where Bronze data resides.
+        chunk: A chunk of Bronze flights data.
 
     Returns:
-        pd.DataFrame: Raw flights data from Bronze.
+        DataFrame with partial sums/counts grouped by YEAR, MONTH, DAY.
+    """
+    nc = chunk[chunk["CANCELLED"] != 1]
+
+    counts = chunk.groupby(["YEAR", "MONTH", "DAY"], as_index=False).agg(
+        TOTAL_FLIGHTS=("FLIGHT_NUMBER", "count"),
+        TOTAL_DELAYED=("DEPARTURE_DELAY", lambda x: (x > 0).sum()),
+        TOTAL_CANCELLED=("CANCELLED", lambda x: (x == 1).sum()),
+    )
+
+    delay_sums = nc.groupby(["YEAR", "MONTH", "DAY"], as_index=False).agg(
+        SUM_DEP_DELAY=("DEPARTURE_DELAY", "sum"),
+        SUM_ARR_DELAY=("ARRIVAL_DELAY", "sum"),
+        COUNT_NC=("FLIGHT_NUMBER", "count"),
+    )
+
+    return counts.merge(delay_sums, on=["YEAR", "MONTH", "DAY"], how="left").fillna(0)
+
+
+def _finalize_daily(partials: pd.DataFrame) -> pd.DataFrame:
+    """Combine partial daily aggregations into final metrics.
+
+    Args:
+        partials: Concatenated partial DataFrames from all chunks.
+
+    Returns:
+        Final flights_daily DataFrame with computed averages.
+    """
+    grp = partials.groupby(
+        ["YEAR", "MONTH", "DAY"], as_index=False,
+    ).sum(numeric_only=True)
+
+    grp["AVG_DEPARTURE_DELAY"] = (
+        grp["SUM_DEP_DELAY"].div(grp["COUNT_NC"].replace(0, float("nan")))
+        .round(2).fillna(0.0)
+    )
+    grp["AVG_ARRIVAL_DELAY"] = (
+        grp["SUM_ARR_DELAY"].div(grp["COUNT_NC"].replace(0, float("nan")))
+        .round(2).fillna(0.0)
+    )
+    grp["MONTH"] = grp["MONTH"].astype(int)
+
+    return grp[["YEAR", "MONTH", "DAY", "TOTAL_FLIGHTS", "TOTAL_DELAYED",
+                "TOTAL_CANCELLED", "AVG_DEPARTURE_DELAY", "AVG_ARRIVAL_DELAY"]]
+
+
+def _partial_monthly(chunk: pd.DataFrame) -> pd.DataFrame:
+    """Compute partial monthly-by-airline aggregation for a single chunk.
+
+    Args:
+        chunk: A chunk of Bronze flights data.
+
+    Returns:
+        DataFrame with partial sums/counts grouped by MONTH, AIRLINE.
+    """
+    nc = chunk[chunk["CANCELLED"] != 1]
+
+    counts = chunk.groupby(["MONTH", "AIRLINE"], as_index=False).agg(
+        TOTAL_FLIGHTS=("FLIGHT_NUMBER", "count"),
+        TOTAL_DELAYED=("DEPARTURE_DELAY", lambda x: (x > 0).sum()),
+        TOTAL_CANCELLED=("CANCELLED", lambda x: (x == 1).sum()),
+    )
+
+    delay_sums = nc.groupby(["MONTH", "AIRLINE"], as_index=False).agg(
+        SUM_ARR_DELAY=("ARRIVAL_DELAY", "sum"),
+        COUNT_NC=("FLIGHT_NUMBER", "count"),
+        ON_TIME_COUNT=("ARRIVAL_DELAY", lambda x: (x <= 15).sum()),
+    )
+
+    return counts.merge(delay_sums, on=["MONTH", "AIRLINE"], how="left").fillna(0)
+
+
+def _finalize_monthly(partials: pd.DataFrame) -> pd.DataFrame:
+    """Combine partial monthly aggregations into final metrics.
+
+    Args:
+        partials: Concatenated partial DataFrames from all chunks.
+
+    Returns:
+        Final flights_monthly DataFrame.
+    """
+    grp = partials.groupby(
+        ["MONTH", "AIRLINE"], as_index=False,
+    ).sum(numeric_only=True)
+
+    grp["AVG_ARRIVAL_DELAY"] = (
+        grp["SUM_ARR_DELAY"].div(grp["COUNT_NC"].replace(0, float("nan")))
+        .round(2).fillna(0.0)
+    )
+    grp["ON_TIME_PCT"] = (
+        grp["ON_TIME_COUNT"].div(grp["COUNT_NC"].replace(0, float("nan")))
+        .mul(100).round(2).fillna(0.0)
+    )
+
+    return grp[["MONTH", "AIRLINE", "TOTAL_FLIGHTS", "TOTAL_DELAYED",
+                "TOTAL_CANCELLED", "AVG_ARRIVAL_DELAY", "ON_TIME_PCT"]]
+
+
+def _partial_airport(chunk: pd.DataFrame) -> pd.DataFrame:
+    """Compute partial per-airport aggregation for a single chunk.
+
+    Args:
+        chunk: A chunk of Bronze flights data.
+
+    Returns:
+        DataFrame with partial sums/counts grouped by ORIGIN_AIRPORT.
+    """
+    nc = chunk[chunk["CANCELLED"] != 1]
+
+    counts = chunk.groupby("ORIGIN_AIRPORT", as_index=False).agg(
+        TOTAL_DEPARTURES=("FLIGHT_NUMBER", "count"),
+        TOTAL_DELAYED=("DEPARTURE_DELAY", lambda x: (x > 0).sum()),
+        TOTAL_CANCELLED=("CANCELLED", lambda x: (x == 1).sum()),
+    )
+
+    delay_sums = nc.groupby("ORIGIN_AIRPORT", as_index=False).agg(
+        SUM_DEP_DELAY=("DEPARTURE_DELAY", "sum"),
+        COUNT_NC=("FLIGHT_NUMBER", "count"),
+        WEATHER_SUM=("WEATHER_DELAY", "sum"),
+    )
+
+    # Sum of all delay-cause columns per airport
+    total_delay = nc.groupby("ORIGIN_AIRPORT", as_index=False)[DELAY_COLS].sum()
+    total_delay["ALL_DELAY_SUM"] = total_delay[DELAY_COLS].sum(axis=1)
+    total_delay = total_delay[["ORIGIN_AIRPORT", "ALL_DELAY_SUM"]]
+
+    result = (
+        counts
+        .merge(delay_sums, on="ORIGIN_AIRPORT", how="left")
+        .merge(total_delay, on="ORIGIN_AIRPORT", how="left")
+        .fillna(0)
+    )
+    return result
+
+
+def _finalize_airport(partials: pd.DataFrame) -> pd.DataFrame:
+    """Combine partial airport aggregations into final metrics.
+
+    Args:
+        partials: Concatenated partial DataFrames from all chunks.
+
+    Returns:
+        Final flights_by_airport DataFrame.
+    """
+    grp = partials.groupby(
+        "ORIGIN_AIRPORT", as_index=False,
+    ).sum(numeric_only=True)
+
+    grp["AVG_DEPARTURE_DELAY"] = (
+        grp["SUM_DEP_DELAY"].div(grp["COUNT_NC"].replace(0, float("nan")))
+        .round(2).fillna(0.0)
+    )
+    grp["PCT_WEATHER_DELAY"] = (
+        grp["WEATHER_SUM"]
+        .div(grp["ALL_DELAY_SUM"].replace(0, float("nan")))
+        .mul(100).round(2).fillna(0.0)
+    )
+
+    return grp[["ORIGIN_AIRPORT", "TOTAL_DEPARTURES", "TOTAL_DELAYED",
+                "TOTAL_CANCELLED", "AVG_DEPARTURE_DELAY", "PCT_WEATHER_DELAY"]]
+
+
+def extract_and_transform(
+    bucket: str,
+) -> tuple:  # (Dict[str, pd.DataFrame], int, int)
+    """Read Bronze flights in chunks and build Silver tables incrementally.
+
+    For each chunk:
+        1. Validate required columns exist.
+        2. Compute partial aggregations (sums and counts).
+        3. Free the chunk from memory.
+
+    After all chunks, combine partials and compute final metrics
+    (means, percentages).
+
+    Args:
+        bucket: S3 bucket name.
+
+    Returns:
+        Tuple of (tables_dict, total_rows, num_chunks).
 
     Raises:
-        Exception: If the S3 read fails (logged before re-raise).
+        FileNotFoundError: If Bronze path has no data.
+        AssertionError: If required columns are missing.
     """
     logger.info("=" * 72)
-    logger.info("EXTRACT — reading flights from Bronze layer")
+    logger.info("EXTRACT + TRANSFORM — chunked (%d rows/chunk)", CHUNK_SIZE)
     logger.info("=" * 72)
 
     s3_path = S3_BRONZE_PREFIX.format(bucket=bucket)
     logger.info("  Source: %s", s3_path)
 
     try:
-        df = wr.s3.read_parquet(path=s3_path)
-        df.columns = df.columns.str.upper()
-        logger.info("  ✓ flights: %d rows, %d cols",
-                     df.shape[0], df.shape[1])
+        reader = wr.s3.read_parquet(path=s3_path, chunked=CHUNK_SIZE)
     except Exception:
-        logger.exception("Failed to read Bronze flights from %s", s3_path)
+        logger.exception("Failed to open Bronze flights from %s", s3_path)
         raise
 
-    # Validate source has essential columns
-    try:
-        for col in ["YEAR", "MONTH", "DAY", "AIRLINE", "ORIGIN_AIRPORT",
-                    "DESTINATION_AIRPORT", "DEPARTURE_DELAY", "ARRIVAL_DELAY",
-                    "CANCELLED", "WEATHER_DELAY"]:
-            assert col in df.columns, (
-                f"Bronze flights missing required column '{col}'"
-            )
-    except AssertionError:
-        logger.exception("Bronze data validation failed")
-        raise
+    daily_parts: List[pd.DataFrame] = []
+    monthly_parts: List[pd.DataFrame] = []
+    airport_parts: List[pd.DataFrame] = []
+    total_rows = 0
+    num_chunks = 0
 
-    return df
+    for chunk in reader:
+        chunk.columns = chunk.columns.str.upper()
 
+        # Validate required columns on first chunk
+        if num_chunks == 0:
+            try:
+                for col in BRONZE_REQUIRED_COLS:
+                    assert col in chunk.columns, (
+                        f"Bronze flights missing required column '{col}'"
+                    )
+            except AssertionError:
+                logger.exception("Bronze data validation failed")
+                raise
 
-# ── Transform ────────────────────────────────────────────────────────────────
+        daily_parts.append(_partial_daily(chunk))
+        monthly_parts.append(_partial_monthly(chunk))
+        airport_parts.append(_partial_airport(chunk))
 
-def build_flights_daily(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate flights to daily level.
+        total_rows += len(chunk)
+        num_chunks += 1
+        logger.info("  ✓ Chunk %d: %d rows (acumulado: %d)",
+                     num_chunks, len(chunk), total_rows)
+        del chunk
 
-    Metrics:
-        * ``TOTAL_FLIGHTS`` — count of flights per day.
-        * ``TOTAL_DELAYED`` — flights with DEPARTURE_DELAY > 0.
-        * ``TOTAL_CANCELLED`` — flights with CANCELLED == 1.
-        * ``AVG_DEPARTURE_DELAY`` — mean delay excluding cancelled.
-        * ``AVG_ARRIVAL_DELAY`` — mean delay excluding cancelled.
+    assert total_rows > 0, "No rows read from Bronze flights"
 
-    Args:
-        df: Raw flights DataFrame from Bronze.
+    logger.info("  Combining partials and computing final metrics ...")
+    tables = {
+        "flights_daily": _finalize_daily(pd.concat(daily_parts)),
+        "flights_monthly": _finalize_monthly(pd.concat(monthly_parts)),
+        "flights_by_airport": _finalize_airport(pd.concat(airport_parts)),
+    }
 
-    Returns:
-        pd.DataFrame: Daily aggregation with YEAR, MONTH, DAY as keys.
-    """
-    logger.info("  Building flights_daily ...")
+    # Validate outputs
+    for name, df in tables.items():
+        validate_dataframe(df, name)
 
-    not_cancelled = df[df["CANCELLED"] != 1]
-
-    agg = df.groupby(["YEAR", "MONTH", "DAY"], as_index=False).agg(
-        TOTAL_FLIGHTS=("AIRLINE", "count"),
-        TOTAL_DELAYED=("DEPARTURE_DELAY",
-                       lambda x: (x > 0).sum()),
-        TOTAL_CANCELLED=("CANCELLED",
-                         lambda x: (x == 1).sum()),
-    )
-
-    delays = (
-        not_cancelled
-        .groupby(["YEAR", "MONTH", "DAY"], as_index=False)
-        .agg(
-            AVG_DEPARTURE_DELAY=("DEPARTURE_DELAY", "mean"),
-            AVG_ARRIVAL_DELAY=("ARRIVAL_DELAY", "mean"),
-        )
-    )
-
-    result = agg.merge(delays, on=["YEAR", "MONTH", "DAY"], how="left")
-
-    result["AVG_DEPARTURE_DELAY"] = result["AVG_DEPARTURE_DELAY"].round(2)
-    result["AVG_ARRIVAL_DELAY"] = result["AVG_ARRIVAL_DELAY"].round(2)
-
-    # Cast MONTH to int for clean partition keys (avoid MONTH=1.0)
-    result["MONTH"] = result["MONTH"].astype(int)
-
-    logger.info("  ✓ flights_daily: %d rows", result.shape[0])
-    return result
-
-
-def build_flights_monthly(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate flights to monthly level by airline.
-
-    Metrics:
-        * ``TOTAL_FLIGHTS`` — count per month/airline.
-        * ``TOTAL_DELAYED`` — DEPARTURE_DELAY > 0.
-        * ``TOTAL_CANCELLED`` — CANCELLED == 1.
-        * ``AVG_ARRIVAL_DELAY`` — mean (excluding cancelled).
-        * ``ON_TIME_PCT`` — % of flights with ARRIVAL_DELAY <= 15.
-
-    Args:
-        df: Raw flights DataFrame from Bronze.
-
-    Returns:
-        pd.DataFrame: Monthly aggregation with MONTH, AIRLINE as keys.
-    """
-    logger.info("  Building flights_monthly ...")
-
-    not_cancelled = df[df["CANCELLED"] != 1]
-
-    agg = df.groupby(["MONTH", "AIRLINE"], as_index=False).agg(
-        TOTAL_FLIGHTS=("AIRLINE", "count"),
-        TOTAL_DELAYED=("DEPARTURE_DELAY",
-                       lambda x: (x > 0).sum()),
-        TOTAL_CANCELLED=("CANCELLED",
-                         lambda x: (x == 1).sum()),
-    )
-
-    delays = (
-        not_cancelled
-        .groupby(["MONTH", "AIRLINE"], as_index=False)
-        .agg(
-            AVG_ARRIVAL_DELAY=("ARRIVAL_DELAY", "mean"),
-        )
-    )
-
-    on_time = (
-        not_cancelled
-        .groupby(["MONTH", "AIRLINE"], as_index=False)
-        .agg(
-            ON_TIME_COUNT=("ARRIVAL_DELAY",
-                           lambda x: (x <= 15).sum()),
-            NON_CANCELLED=("ARRIVAL_DELAY", "count"),
-        )
-    )
-    on_time["ON_TIME_PCT"] = (
-        (on_time["ON_TIME_COUNT"] / on_time["NON_CANCELLED"] * 100)
-        .round(2)
-    )
-    on_time = on_time.drop(columns=["ON_TIME_COUNT", "NON_CANCELLED"])
-
-    result = (
-        agg
-        .merge(delays, on=["MONTH", "AIRLINE"], how="left")
-        .merge(on_time, on=["MONTH", "AIRLINE"], how="left")
-    )
-
-    result["AVG_ARRIVAL_DELAY"] = result["AVG_ARRIVAL_DELAY"].round(2)
-
-    logger.info("  ✓ flights_monthly: %d rows", result.shape[0])
-    return result
-
-
-def build_flights_by_airport(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate departure statistics by origin airport.
-
-    Metrics:
-        * ``TOTAL_DEPARTURES`` — count per airport.
-        * ``TOTAL_DELAYED`` — DEPARTURE_DELAY > 0.
-        * ``TOTAL_CANCELLED`` — CANCELLED == 1.
-        * ``AVG_DEPARTURE_DELAY`` — mean (excluding cancelled).
-        * ``PCT_WEATHER_DELAY`` — weather delay as % of total delays.
-
-    Args:
-        df: Raw flights DataFrame from Bronze.
-
-    Returns:
-        pd.DataFrame: Per-airport aggregation.
-    """
-    logger.info("  Building flights_by_airport ...")
-
-    not_cancelled = df[df["CANCELLED"] != 1]
-
-    delay_cols = [
-        "AIR_SYSTEM_DELAY", "SECURITY_DELAY", "AIRLINE_DELAY",
-        "LATE_AIRCRAFT_DELAY", "WEATHER_DELAY",
-    ]
-
-    agg = df.groupby("ORIGIN_AIRPORT", as_index=False).agg(
-        TOTAL_DEPARTURES=("AIRLINE", "count"),
-        TOTAL_DELAYED=("DEPARTURE_DELAY",
-                       lambda x: (x > 0).sum()),
-        TOTAL_CANCELLED=("CANCELLED",
-                         lambda x: (x == 1).sum()),
-    )
-
-    avg_delay = (
-        not_cancelled
-        .groupby("ORIGIN_AIRPORT", as_index=False)
-        .agg(AVG_DEPARTURE_DELAY=("DEPARTURE_DELAY", "mean"))
-    )
-
-    # Weather delay as percentage of all delay causes
-    delay_sums = not_cancelled.groupby("ORIGIN_AIRPORT", as_index=False).agg(
-        WEATHER_SUM=("WEATHER_DELAY", "sum"),
-    )
-    total_delay = (
-        not_cancelled
-        .groupby("ORIGIN_AIRPORT", as_index=False)[delay_cols]
-        .sum()
-    )
-    total_delay["TOTAL_DELAY_SUM"] = total_delay[delay_cols].sum(axis=1)
-    total_delay = total_delay[["ORIGIN_AIRPORT", "TOTAL_DELAY_SUM"]]
-
-    weather = delay_sums.merge(total_delay, on="ORIGIN_AIRPORT", how="left")
-
-    # Avoid division by zero
-    weather["PCT_WEATHER_DELAY"] = (
-        weather["WEATHER_SUM"]
-        .div(weather["TOTAL_DELAY_SUM"].replace(0, float("nan")))
-        .mul(100)
-        .round(2)
-        .fillna(0.0)
-    )
-    weather = weather.drop(columns=["WEATHER_SUM", "TOTAL_DELAY_SUM"])
-
-    result = (
-        agg
-        .merge(avg_delay, on="ORIGIN_AIRPORT", how="left")
-        .merge(weather, on="ORIGIN_AIRPORT", how="left")
-    )
-
-    result["AVG_DEPARTURE_DELAY"] = result["AVG_DEPARTURE_DELAY"].round(2)
-
-    logger.info("  ✓ flights_by_airport: %d rows", result.shape[0])
-    return result
-
-
-def transform(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Build all Silver aggregation tables and validate them.
-
-    Args:
-        df: Raw flights DataFrame from Bronze.
-
-    Returns:
-        Dict mapping table names to their aggregated DataFrames.
-
-    Raises:
-        AssertionError: If any output table fails validation.
-    """
-    logger.info("=" * 72)
-    logger.info("TRANSFORM — build Silver aggregations")
-    logger.info("=" * 72)
-
-    try:
-        tables: Dict[str, pd.DataFrame] = {
-            "flights_daily": build_flights_daily(df),
-            "flights_monthly": build_flights_monthly(df),
-            "flights_by_airport": build_flights_by_airport(df),
-        }
-    except Exception:
-        logger.exception("Transform phase failed")
-        raise
-
-    # Validate every output table
-    logger.info("  Validating Silver tables ...")
-    for table_name, table_df in tables.items():
-        validate_dataframe(table_df, table_name)
-
-    return tables
+    logger.info("  ✓ All Silver tables built from %d total rows", total_rows)
+    return tables, total_rows, num_chunks
 
 
 # ── Load ─────────────────────────────────────────────────────────────────────
@@ -581,20 +591,33 @@ def main(bucket: str) -> None:
         # ── Glue database ────────────────────────────────────────────────
         create_glue_database(GLUE_DATABASE_SILVER)
 
-        # ── Extract ──────────────────────────────────────────────────────
-        flights_df = extract(bucket)
-
-        # ── Transform ────────────────────────────────────────────────────
-        silver_tables = transform(flights_df)
-
-        # Free source DataFrame after transform
-        del flights_df
+        # ── Extract + Transform (chunked) ────────────────────────────────
+        t0 = time.time()
+        silver_tables, total_rows, num_chunks = extract_and_transform(bucket)
+        elapsed_et = time.time() - t0
 
         # ── Load ─────────────────────────────────────────────────────────
+        t1 = time.time()
         load(silver_tables, bucket, GLUE_DATABASE_SILVER)
+        elapsed_load = time.time() - t1
 
-        # ── Done ─────────────────────────────────────────────────────────
+        # ── Cifras de control ─────────────────────────────────────────────
+        elapsed_total = time.time() - t0
         logger.info("\n%s", "=" * 72)
+        logger.info("  CIFRAS DE CONTROL")
+        logger.info("%s", "-" * 72)
+        logger.info("  Bronze filas leídas       : %s", f"{total_rows:,}")
+        logger.info("  Chunks procesados         : %d (× %s filas)",
+                     num_chunks, f"{CHUNK_SIZE:,}")
+        logger.info("%s", "-" * 72)
+        for tbl_name, tbl_df in silver_tables.items():
+            logger.info("  %-25s : %6s filas, %2d cols",
+                        tbl_name, f"{tbl_df.shape[0]:,}", tbl_df.shape[1])
+        logger.info("%s", "-" * 72)
+        logger.info("  Extract + Transform       : %.1f s", elapsed_et)
+        logger.info("  Load                      : %.1f s", elapsed_load)
+        logger.info("  Total                     : %.1f s", elapsed_total)
+        logger.info("%s", "=" * 72)
         logger.info("  ✓ SILVER LAYER COMPLETED SUCCESSFULLY")
         logger.info("%s\n", "=" * 72)
 
