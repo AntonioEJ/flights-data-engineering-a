@@ -42,6 +42,8 @@ import argparse
 from typing import Dict, List
 
 import pandas as pd
+import boto3
+from botocore.exceptions import ClientError
 import awswrangler as wr
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -243,21 +245,33 @@ def transform(
 # ── Load ─────────────────────────────────────────────────────────────────────
 
 def create_glue_database(database: str) -> None:
-    """Create an AWS Glue database idempotently.
+    """Create an AWS Glue database if it does not already exist.
+
+    Uses ``boto3`` directly with ``CreateDatabase`` to avoid the
+    ``glue:UpdateDatabase`` permission required by awswrangler's
+    ``exist_ok=True``.
 
     Args:
         database: Glue database name.
 
     Raises:
-        botocore.exceptions.ClientError: On AWS API failure.
+        botocore.exceptions.ClientError: On unexpected AWS API failure.
     """
     try:
-        wr.catalog.create_database(
-            name=database,
-            description="Bronze layer — raw flights data",
-            exist_ok=True,
+        glue = boto3.client("glue")
+        glue.create_database(
+            DatabaseInput={
+                "Name": database,
+                "Description": "Bronze layer — raw flights data",
+            }
         )
-        logger.info("  ✓ Glue database '%s' ready", database)
+        logger.info("  ✓ Glue database '%s' created", database)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "AlreadyExistsException":
+            logger.info("  ✓ Glue database '%s' already exists", database)
+        else:
+            logger.exception("Failed to create Glue database '%s'", database)
+            raise
     except Exception:
         logger.exception("Failed to create Glue database '%s'", database)
         raise
