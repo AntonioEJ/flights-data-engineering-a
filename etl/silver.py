@@ -40,6 +40,7 @@ Date:
     2026-04
 """
 
+import gc
 import sys
 import os
 import time
@@ -364,17 +365,25 @@ def extract_and_transform(
         AssertionError: If required columns are missing.
     """
     logger.info("=" * 72)
-    logger.info("EXTRACT + TRANSFORM — chunked (%d rows/chunk)", CHUNK_SIZE)
+    logger.info("EXTRACT + TRANSFORM — file-by-file (only %d cols)",
+                len(BRONZE_REQUIRED_COLS))
     logger.info("=" * 72)
 
     s3_path = S3_BRONZE_PREFIX.format(bucket=bucket)
     logger.info("  Source: %s", s3_path)
 
+    # List individual Parquet files — avoids Ray chunked reader.
     try:
-        reader = wr.s3.read_parquet(path=s3_path, chunked=CHUNK_SIZE)
+        files = wr.s3.list_objects(path=s3_path, suffix=".parquet")
     except Exception:
-        logger.exception("Failed to open Bronze flights from %s", s3_path)
+        logger.exception("Failed to list Bronze files at %s", s3_path)
         raise
+
+    assert files, f"No Parquet files found at {s3_path}"
+    logger.info("  Found %d Parquet files", len(files))
+
+    # Read only the columns Silver actually needs (halves RAM usage).
+    read_cols = [c.lower() for c in BRONZE_REQUIRED_COLS]
 
     daily_parts: List[pd.DataFrame] = []
     monthly_parts: List[pd.DataFrame] = []
@@ -382,10 +391,18 @@ def extract_and_transform(
     total_rows = 0
     num_chunks = 0
 
-    for chunk in reader:
+    for fpath in files:
+        try:
+            chunk = wr.s3.read_parquet(
+                path=fpath, columns=read_cols, use_threads=False,
+            )
+        except Exception:
+            logger.exception("Failed to read %s", fpath)
+            raise
+
         chunk.columns = chunk.columns.str.upper()
 
-        # Validate required columns on first chunk
+        # Validate required columns on first file
         if num_chunks == 0:
             try:
                 for col in BRONZE_REQUIRED_COLS:
@@ -402,9 +419,10 @@ def extract_and_transform(
 
         total_rows += len(chunk)
         num_chunks += 1
-        logger.info("  ✓ Chunk %d: %d rows (acumulado: %d)",
-                     num_chunks, len(chunk), total_rows)
+        logger.info("  ✓ File %d/%d: %d rows (acumulado: %d)",
+                     num_chunks, len(files), len(chunk), total_rows)
         del chunk
+        gc.collect()
 
     assert total_rows > 0, "No rows read from Bronze flights"
 
@@ -607,8 +625,7 @@ def main(bucket: str) -> None:
         logger.info("  CIFRAS DE CONTROL")
         logger.info("%s", "-" * 72)
         logger.info("  Bronze filas leídas       : %s", f"{total_rows:,}")
-        logger.info("  Chunks procesados         : %d (× %s filas)",
-                     num_chunks, f"{CHUNK_SIZE:,}")
+        logger.info("  Archivos Parquet leídos   : %d", num_chunks)
         logger.info("%s", "-" * 72)
         for tbl_name, tbl_df in silver_tables.items():
             logger.info("  %-25s : %6s filas, %2d cols",
