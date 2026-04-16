@@ -151,31 +151,41 @@ Bronze tables (Glue)  ──CTAS (Athena)──▶  Gold analytical table (S3 + 
 
 ## 📁 Estructura del Repositorio
 ```
-lights-data-engineering-a/
-├── artifacts/ → Screenshots de evidencia para evaluación académica
-│ └── screenshots/
-├── config/ → Variables AWS, credenciales y conexiones PostgreSQL
-│ └── init.py
-├── db/ → DDL scripts y esquemas del modelo relacional
-├── docs/ → Diagrama ER y documentación técnica
-│ ├── erd-flights.drawio
-│ ├── erd-flights.png
-│ └── screenshots/
-├── etl/ → Pipeline Medallion (Bronze → Silver → Gold)
-│ ├── bronze.py
-│ ├── gold.py
-│ └── silver.py
-├── infra/ → CloudFormation templates para RDS PostgreSQL
-│ └── rds-flights.yaml
-├── notebooks/ → EDA, regresión lineal y forecasting
-│ └── flights_analytics.ipynb
+flights-data-engineering-a/
+├── config/                → Variables AWS, credenciales y conexiones
+│   └── __init__.py
+├── data/                  → Datos crudos descargados (no versionados)
+│   └── flights/
+│       ├── flights.csv
+│       ├── airlines.csv
+│       └── airports.csv
+├── db/                    → DDL scripts y esquemas del modelo relacional
+├── docs/                  → Diagrama ER y documentación técnica
+│   ├── erd-flights.drawio
+│   ├── erd-flights.png
+│   └── screenshots/
+├── etl/                   → Pipeline Medallion (Bronze → Silver → Gold)
+│   ├── bronze.py
+│   ├── silver.py
+│   └── gold.py
+├── infra/                 → CloudFormation templates para RDS PostgreSQL
+│   └── rds-flights.yaml
+├── logs/                  → Logs de ejecución ETL (generados automáticamente)
+│   ├── bronze_etl.log
+│   ├── silver_etl.log
+│   └── gold_etl.log
+├── notebooks/             → EDA, regresión lineal y forecasting
+│   └── flights_analytics.ipynb
+├── sql/                   → CREATE TABLE statements y analytical queries
+├── src/                   → Utilities: S3 client, PostgreSQL connector
+│   └── __init__.py
+├── tests/                 → Unit tests y data quality checks
+│   └── __init__.py
+├── .gitignore
+├── .pylintrc
+├── download_data.sh       → Descarga los CSVs del dataset
 ├── README.md
-├── requirements.txt
-├── sql/ → CREATE TABLE statements y analytical queries
-├── src/ → Utilities: S3 client, PostgreSQL connector, validators
-│ └── init.py
-└── tests/ → Unit tests y data quality checks
-└── init.py
+└── requirements.txt
 ```
 
 ---
@@ -220,12 +230,17 @@ python etl/gold.py --bucket <tu-bucket>
 
 ### Buenas Prácticas Implementadas
 
-| Práctica | Descripción |
+| Práctica | Implementación |
 |---|---|
-| **Idempotencia** | Cada script puede ejecutarse múltiples veces sin duplicar datos (sobrescritura controlada). |
-| **Logging** | Uso de `logging` para registrar progreso, errores y métricas de ejecución. |
-| **Modularidad** | Funciones atómicas y reutilizables en `src/`. Cada capa es independiente. |
-| **Separación de configuración** | Parámetros externalizados en `config/settings.py`. |
+| **Idempotencia** | Bronze: `overwrite` / `append` por chunks. Silver: `overwrite_partitions` y `overwrite`. Gold: `delete_table_if_exists` + limpieza S3 antes de CTAS. |
+| **Memory-safe** | Bronze: chunks de 500K filas. Silver: lectura file-by-file, solo 15 columnas, `gc.collect()`. Gold: Athena ejecuta el CTAS (sin carga en RAM). |
+| **Logging profesional** | Módulo `logging` con handlers a consola + archivo (`logs/{capa}_etl.log`). Timestamps, fases claramente delimitadas, cifras de control al final. |
+| **Manejo de errores** | `try/except` en cada fase con `logger.exception()` + `raise`. `main()` captura todo y hace `sys.exit(1)`. |
+| **Docstrings** | Todas las funciones documentadas con descripción, `Args`, `Returns` y `Raises`. |
+| **Modularidad** | Patrón `extract → transform → load → main` en cada script. Funciones con responsabilidad única. |
+| **Cifras de control** | Cada script imprime al final: filas procesadas, tablas generadas, tiempos por fase. |
+| **CLI** | `argparse` con `--bucket` (y `--data-dir` en Bronze). Ayuda con `--help`. |
+| **Pylint** | Bronze: 9.38/10. Silver: 9.49/10. Gold: 9.40/10. |
 
 ---
 
@@ -266,34 +281,63 @@ aws cloudformation deploy \
 - `chmod +x download_data.sh` para dar permisos de ejecución
 - `./download_data.sh` para ejecutar el script
 
-Esta sección debe ser añadida después de la última línea del bloque CloudFormation de la sección "Infraestructura".
-
 ---
 
-## Scripts de Ejecución
+## 🚀 Ejecución Completa
 
-| Script | Responsabilidad |
-|--------|----------------|
-| `etl/bronze.py` | Sube los tres CSVs a S3 y los registra en Glue |
-| `etl/silver.py` | Transforma a Parquet + Snappy y construye las tres agregaciones |
-| `etl/gold.py` | Ejecuta el CTAS en Athena para construir la tabla analítica |
+### Prerequisitos
 
-### Ejecución desde Terminal
-
-Ejecuta los scripts en orden desde el terminal de SageMaker Jupyter Lab:
+1. Ambiente **SageMaker Studio** con acceso a S3, Glue y Athena.
+2. Dataset descargado en `data/flights/` (ver `download_data.sh`).
+3. Dependencias instaladas:
 
 ```bash
-python etl/bronze.py --bucket <tu-bucket> --data-dir data/flights/
-python etl/silver.py --bucket <tu-bucket>
-python etl/gold.py --bucket <tu-bucket>
-````
-### 3. Crear entorno virtual e instalar dependencias
-
-```bash
-python -m venv .venv
-source .venv/bin/activate  # En Linux/Mac
-# .venv\Scripts\activate   # En Windows
-
-pip install --upgrade pip
 pip install -r requirements.txt
-````
+```
+
+### Pipeline — Ejecutar en Orden
+
+```bash
+# 1. Bronze — CSV → Parquet → S3 + Glue
+python etl/bronze.py --bucket itam-analytics-antonio --data-dir data/flights/
+
+# 2. Silver — Agregaciones de negocio
+python etl/silver.py --bucket itam-analytics-antonio
+
+# 3. Gold — CTAS desnormalizado en Athena
+python etl/gold.py --bucket itam-analytics-antonio
+```
+
+> Cada script depende del anterior: Bronze debe completarse antes de Silver,
+> y Bronze antes de Gold.
+
+### Logs Generados
+
+Cada ejecución genera un archivo de log con cifras de control:
+
+| Log | Contenido |
+|---|---|
+| `logs/bronze_etl.log` | Filas por tabla, chunks procesados, tiempos |
+| `logs/silver_etl.log` | Filas Bronze leídas, archivos Parquet, filas/cols por tabla Silver, tiempos |
+| `logs/gold_etl.log` | Tabla creada, filas totales, validación de JOINs, tiempos |
+
+### Ejemplo de Cifras de Control (Silver)
+
+```
+========================================================================
+  CIFRAS DE CONTROL
+------------------------------------------------------------------------
+  Bronze filas leídas       : 5,819,079
+  Archivos Parquet leídos   : 12
+------------------------------------------------------------------------
+  flights_daily             :    365 filas,  8 cols
+  flights_monthly           :    168 filas,  7 cols
+  flights_by_airport        :    322 filas,  6 cols
+------------------------------------------------------------------------
+  Extract + Transform       : 42.3 s
+  Load                      :  8.1 s
+  Total                     : 50.4 s
+========================================================================
+  ✓ SILVER LAYER COMPLETED SUCCESSFULLY
+========================================================================
+```
