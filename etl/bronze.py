@@ -204,18 +204,17 @@ def extract(data_dir: str) -> Dict[str, pd.DataFrame]:
 
             kwargs = {
                 "filepath_or_buffer": file_path,
-                "engine": "pyarrow",
-                # low_memory is not supported by pyarrow engine (reads full file natively)
+                "engine": "c",
             }
             if table_name == "flights":
                 kwargs["dtype"] = FLIGHTS_DTYPES
 
-            # Guard: ensure no incompatible options are passed to pyarrow engine
-            incompatible_with_pyarrow = {"low_memory", "memory_map", "warn_bad_lines", "error_bad_lines"}
-            invalid_keys = incompatible_with_pyarrow & set(kwargs.keys())
+            # Guard: ensure no incompatible options are passed to c engine
+            incompatible_with_c = {"memory_map"}
+            invalid_keys = incompatible_with_c & set(kwargs.keys())
             if invalid_keys:
                 raise ValueError(
-                    "Options %s are not supported with engine='pyarrow'", invalid_keys
+                    f"Options {invalid_keys} are not supported with engine='c'"
                 )
 
             df = pd.read_csv(**kwargs)
@@ -407,7 +406,7 @@ def load(
         logger.info("=" * 80)
         logger.info("LOAD PHASE COMPLETED")
         logger.info("=" * 80)
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         logger.exception("Load phase failed")
         raise
 
@@ -463,7 +462,7 @@ def main(bucket: str, data_dir: str) -> None:
         )
         logger.info("╚" + "=" * 78 + "╝\n")
 
-    except (ValueError, FileNotFoundError, OSError, RuntimeError):  # fix W0718
+    except Exception:  # pylint: disable=broad-exception-caught
         logger.exception("Bronze layer ETL pipeline failed")
         sys.exit(1)
 
