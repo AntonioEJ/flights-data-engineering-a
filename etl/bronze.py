@@ -3,23 +3,32 @@
 Bronze Layer ETL Script
 =======================
 
-Ingest raw CSV data from a local directory, upload to Amazon S3 as Parquet,
-and register tables in AWS Glue Data Catalog.
+Ingest raw CSV data from a local directory, upload to Amazon S3 as
+Parquet, and register tables in AWS Glue Data Catalog.
 
-This module implements the Bronze layer of the Medallion architecture
-for the U.S. Domestic Flights 2015 dataset (~5.8M records).
+This module implements the **Bronze layer** of the Medallion
+architecture for the U.S. Domestic Flights 2015 dataset (~5.8 M rows).
+Bronze stores data as-is from the source with minimal transformation
+(column name uppercasing only).
 
-Usage:
-    .. code-block:: bash
+Pipeline flow::
 
-        python etl/bronze.py --bucket <tu-bucket> --data-dir data/
+    CSV (local) ──▶ Validate ──▶ Parquet (S3) ──▶ Glue Catalog
 
-Module Attributes:
-    CSV_FILES (dict): Mapping of table names to their CSV filenames.
-    GLUE_DATABASE (str): Name of the Glue database for the Bronze layer.
-    S3_BRONZE_PATH_TEMPLATE (str): Template for S3 paths in the Bronze layer.
+Usage::
 
-Author:
+    python etl/bronze.py --bucket <tu-bucket> --data-dir data/flights/
+
+Design decisions:
+    * **Idempotent**: Glue DB created with ``exist_ok=True``; small
+      tables use ``mode='overwrite'``; flights first chunk overwrites,
+      subsequent chunks append.
+    * **Memory-safe**: ``flights.csv`` (~5.8 M rows) is read in chunks
+      of ``CHUNK_SIZE`` rows to avoid OOM on constrained environments.
+    * **Fail-loud**: every critical step is wrapped in ``try/except``
+      with ``logger.exception`` and ``sys.exit(1)``.
+
+Authors:
     José Antonio Esparza, Gustavo Pardo
 
 Date:
@@ -30,369 +39,251 @@ import sys
 import os
 import logging
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed  # fix C0411
-from typing import Dict
+from typing import Dict, List
+
 import pandas as pd
 import awswrangler as wr
 
-# ---------------------------------------------------------------------------
-# Module Constants
-# ---------------------------------------------------------------------------
+# ── Constants ────────────────────────────────────────────────────────────────
 
 CSV_FILES: Dict[str, str] = {
-    "flights": "flights.csv",
+    "flights":  "flights.csv",
     "airlines": "airlines.csv",
     "airports": "airports.csv",
 }
-"""dict: Mapping of logical table names to their source CSV filenames."""
+"""Mapping of logical table names to their source CSV filenames."""
 
 GLUE_DATABASE: str = "flights_bronze"
-"""str: AWS Glue Data Catalog database name for the Bronze layer."""
+"""AWS Glue Data Catalog database name for the Bronze layer."""
 
-S3_BRONZE_PATH_TEMPLATE: str = "s3://{bucket}/flights/bronze/{table}/"
-"""str: S3 URI template. Placeholders: ``{bucket}`` and ``{table}``."""
+S3_PREFIX_TEMPLATE: str = "s3://{bucket}/flights/bronze/{table}/"
+"""S3 URI template.  Placeholders: ``{bucket}`` and ``{table}``."""
 
 CHUNK_SIZE: int = 500_000
-"""int: Number of rows per chunk when reading large CSV files."""
+"""Number of rows per chunk when reading ``flights.csv``."""
 
-FLIGHTS_DTYPES: Dict[str, str] = {
-    "YEAR": "int16",
-    "MONTH": "int8", 
-    "DAY": "int8",
-    "DAY_OF_WEEK": "int8",
-    "AIRLINE": "category",
-    "FLIGHT_NUMBER": "int32",
-    "TAIL_NUMBER": "str",
-    "ORIGIN_AIRPORT": "category", 
-    "DESTINATION_AIRPORT": "category",
-    "SCHEDULED_DEPARTURE": "int32",
-    "DEPARTURE_TIME": "float32",
-    "DEPARTURE_DELAY": "float32",
-    "TAXI_OUT": "float32",
-    "WHEELS_OFF": "float32",
-    "SCHEDULED_TIME": "float32",
-    "ELAPSED_TIME": "float32",
-    "AIR_TIME": "float32",
-    "DISTANCE": "float32",
-    "WHEELS_ON": "float32",
-    "TAXI_IN": "float32",
-    "SCHEDULED_ARRIVAL": "int32",
-    "ARRIVAL_TIME": "float32",
-    "ARRIVAL_DELAY": "float32",
-    "DIVERTED": "int8",
-    "CANCELLED": "int8",
-    "CANCELLATION_REASON": "category",
-    "AIR_SYSTEM_DELAY": "float32",
-    "SECURITY_DELAY": "float32",
-    "AIRLINE_DELAY": "float32",
-    "LATE_AIRCRAFT_DELAY": "float32",
-    "WEATHER_DELAY": "float32",
+# Expected key columns per table — used for pre-write validation.
+REQUIRED_COLUMNS: Dict[str, List[str]] = {
+    "flights":  ["AIRLINE", "ORIGIN_AIRPORT", "DESTINATION_AIRPORT",
+                 "FLIGHT_NUMBER"],
+    "airlines": ["IATA_CODE", "AIRLINE"],
+    "airports": ["IATA_CODE", "AIRPORT", "CITY", "STATE"],
 }
-"""dict: Data types for the flights table."""
+"""Columns that *must* exist in each table before writing to S3."""
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+NON_NULL_COLUMNS: Dict[str, List[str]] = {
+    "airlines": ["IATA_CODE"],
+    "airports": ["IATA_CODE"],
+}
+"""Columns that must have zero NULLs for a table to pass validation."""
 
+
+# ── Logging ──────────────────────────────────────────────────────────────────
 
 def setup_logging() -> logging.Logger:
-    """Configure and return the module-level logger with file and console output."""
-    _logger = logging.getLogger(__name__)  # fix W0621: renamed from logger to _logger
+    """Create the module logger with console **and** file handlers.
+
+    Log file is written to ``logs/bronze_etl.log``.  The directory is
+    created automatically if it does not exist.
+
+    Returns:
+        logging.Logger: Configured logger instance.
+    """
+    _logger = logging.getLogger("bronze_etl")
     _logger.setLevel(logging.INFO)
 
-    log_dir = "logs"
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
+    os.makedirs("logs", exist_ok=True)
 
-    formatter = logging.Formatter(
+    fmt = logging.Formatter(
         fmt="[%(asctime)s] [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-
-    log_file = os.path.join(log_dir, "bronze_etl.log")
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(formatter)
-
     if not _logger.handlers:
-        _logger.addHandler(console_handler)
-        _logger.addHandler(file_handler)
+        console = logging.StreamHandler()
+        console.setFormatter(fmt)
+        _logger.addHandler(console)
+
+        fh = logging.FileHandler("logs/bronze_etl.log")
+        fh.setFormatter(fmt)
+        _logger.addHandler(fh)
 
     return _logger
 
 
 logger: logging.Logger = setup_logging()
-"""logging.Logger: Module-level logger used across all functions."""
-
-# ---------------------------------------------------------------------------
-# Validation Helpers
-# ---------------------------------------------------------------------------
 
 
-def validate_dataframe(df: pd.DataFrame, table_name: str) -> None:
-    """Validate that a DataFrame is not empty and contains data.
+# ── Validation helpers ───────────────────────────────────────────────────────
+
+def validate_file(file_path: str) -> None:
+    """Raise ``FileNotFoundError`` if *file_path* does not exist.
 
     Args:
-        df (pd.DataFrame): The DataFrame to validate.
-        table_name (str): Logical name of the table (used in error messages).
+        file_path: Path to verify.
 
     Raises:
-        AssertionError: If the DataFrame is empty or has zero rows/columns.
-
-    Example:
-        >>> import pandas as pd
-        >>> df = pd.DataFrame({"col": [1, 2]})
-        >>> validate_dataframe(df, "test")  # passes silently
+        FileNotFoundError: When the file is absent.
     """
-    assert not df.empty, f"DataFrame for {table_name} is empty"
-    assert df.shape[0] > 0, f"Table {table_name} has no rows"
-    assert df.shape[1] > 0, f"Table {table_name} has no columns"
-
-
-def validate_file_path(file_path: str) -> None:
-    """Validate that a file exists on disk.
-
-    Args:
-        file_path (str): Absolute or relative path to the file.
-
-    Raises:
-        FileNotFoundError: If the file does not exist.
-
-    Example:
-        >>> validate_file_path("data/flights.csv")  # raises if missing
-    """
-    if not os.path.exists(file_path):
+    if not os.path.isfile(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
 
-# ---------------------------------------------------------------------------
-# Extract Phase
-# ---------------------------------------------------------------------------
+def validate_dataframe(df: pd.DataFrame, table_name: str) -> None:
+    """Run Bronze-level quality checks on *df*.
 
-
-def extract(data_dir: str) -> Dict[str, pd.DataFrame]:
-    """Read small CSV files from a local directory (excludes flights).
-
-    Reads ``airlines.csv`` and ``airports.csv`` into memory.
-    The large ``flights.csv`` is handled separately by
-    :func:`extract_and_load_flights` using chunked processing.
+    Checks performed:
+        1. DataFrame is not empty.
+        2. Required columns exist (per ``REQUIRED_COLUMNS``).
+        3. Non-null columns have zero NULLs (per ``NON_NULL_COLUMNS``).
 
     Args:
-        data_dir (str): Path to the directory that contains the CSV files.
-
-    Returns:
-        Dict[str, pd.DataFrame]: Dictionary mapping each small table name
-        (``airlines``, ``airports``) to its DataFrame.
+        df: The DataFrame to validate.
+        table_name: Logical table name (for error messages and lookups).
 
     Raises:
-        FileNotFoundError: If any expected CSV file is missing.
-        pd.errors.ParserError: If a CSV file cannot be parsed.
-
-    Example:
-        >>> data = extract("data/")
-        >>> data.keys()
-        dict_keys(['airlines', 'airports'])
+        AssertionError: If any check fails.
     """
-    logger.info("=" * 80)
-    logger.info("STARTING EXTRACT PHASE (small tables)")
-    logger.info("=" * 80)
+    # 1. Non-empty
+    assert not df.empty, f"DataFrame for '{table_name}' is empty"
+    assert df.shape[0] > 0, f"'{table_name}' has 0 rows"
+    assert df.shape[1] > 0, f"'{table_name}' has 0 columns"
+
+    # 2. Required columns
+    required = REQUIRED_COLUMNS.get(table_name, [])
+    for col in required:
+        assert col in df.columns, (
+            f"'{table_name}' is missing required column '{col}'"
+        )
+
+    # 3. Non-null constraints
+    for col in NON_NULL_COLUMNS.get(table_name, []):
+        if col in df.columns:
+            null_count = int(df[col].isna().sum())
+            assert null_count == 0, (
+                f"'{table_name}.{col}' has {null_count} NULLs"
+            )
+
+    logger.info("  ✓ %s passed validation (%d rows, %d cols)",
+                table_name, df.shape[0], df.shape[1])
+
+
+# ── Extract ──────────────────────────────────────────────────────────────────
+
+def extract_small_tables(data_dir: str) -> Dict[str, pd.DataFrame]:
+    """Read ``airlines.csv`` and ``airports.csv`` fully into memory.
+
+    ``flights.csv`` is excluded because it is too large; it is handled
+    by :func:`process_flights_chunked`.
+
+    Args:
+        data_dir: Directory containing the CSV files.
+
+    Returns:
+        Dict mapping ``"airlines"`` and ``"airports"`` to DataFrames.
+
+    Raises:
+        FileNotFoundError: If a CSV file is missing.
+    """
+    logger.info("=" * 72)
+    logger.info("EXTRACT — small tables (airlines, airports)")
+    logger.info("=" * 72)
 
     data: Dict[str, pd.DataFrame] = {}
-    for table_name, filename in CSV_FILES.items():
-        if table_name == "flights":
-            continue  # handled by extract_and_load_flights
-        file_path = os.path.join(data_dir, filename)
+    for table, filename in CSV_FILES.items():
+        if table == "flights":
+            continue
+
+        path = os.path.join(data_dir, filename)
         try:
-            logger.info("Reading file: %s", file_path)  # fix W1203
-            validate_file_path(file_path)
-            df = pd.read_csv(file_path, engine="c")
-            data[table_name] = df
-            logger.info(
-                "✓ Read %s: %d rows, %d columns",  # fix W1203
-                table_name, df.shape[0], df.shape[1]
-            )
+            validate_file(path)
+            df = pd.read_csv(path, engine="c")
+            df.columns = df.columns.str.upper()
+            data[table] = df
+            logger.info("  ✓ %s: %d rows, %d cols",
+                        table, df.shape[0], df.shape[1])
         except Exception:
-            logger.exception("Failed to read %s", filename)  # fix W1203
+            logger.exception("Failed to read %s", path)
             raise
 
-    logger.info("=" * 80)
-    logger.info("EXTRACT PHASE COMPLETED (small tables)")
-    logger.info("=" * 80)
     return data
 
 
-def extract_and_load_flights(
-    data_dir: str, bucket: str, database: str = GLUE_DATABASE
-) -> int:
-    """Read flights.csv in chunks and upload each chunk to S3 as Parquet.
+# ── Transform ────────────────────────────────────────────────────────────────
 
-    Processes the large flights file in batches of :pydata:`CHUNK_SIZE`
-    rows to avoid exceeding available memory.  The first chunk uses
-    ``mode='overwrite'`` to replace any previous data; subsequent chunks
-    use ``mode='append'``.
+def transform(
+    data: Dict[str, pd.DataFrame],
+) -> Dict[str, pd.DataFrame]:
+    """Validate every DataFrame and uppercase column names.
 
     Args:
-        data_dir (str): Path to the directory that contains ``flights.csv``.
-        bucket (str): Target S3 bucket name.
-        database (str, optional): Glue database name.
-            Defaults to :pydata:`GLUE_DATABASE`.
+        data: Raw DataFrames keyed by table name.
 
     Returns:
-        int: Total number of rows processed.
-
-    Raises:
-        FileNotFoundError: If ``flights.csv`` is missing.
-        botocore.exceptions.ClientError: If the S3/Glue API call fails.
-
-    Example:
-        >>> total = extract_and_load_flights("data/", "my-bucket")
-        >>> total
-        5819811
-    """
-    file_path = os.path.join(data_dir, CSV_FILES["flights"])
-    validate_file_path(file_path)
-
-    s3_path = S3_BRONZE_PATH_TEMPLATE.format(bucket=bucket, table="flights")
-    logger.info("Processing flights.csv in chunks of %d rows", CHUNK_SIZE)
-    logger.info("Target S3 path: %s", s3_path)
-
-    total_rows = 0
-    chunks = pd.read_csv(file_path, engine="c", chunksize=CHUNK_SIZE)
-
-    for i, chunk in enumerate(chunks):
-        chunk.columns = chunk.columns.str.upper()
-        mode = "overwrite" if i == 0 else "append"
-        wr.s3.to_parquet(
-            df=chunk,
-            path=s3_path,
-            dataset=True,
-            database=database,
-            table="flights",
-            mode=mode,
-            compression="snappy",
-        )
-        total_rows += len(chunk)
-        logger.info(
-            "✓ Chunk %d uploaded: %d rows (total: %d)",
-            i + 1, len(chunk), total_rows
-        )
-        del chunk  # free memory immediately
-
-    logger.info("✓ flights table loaded with %d total rows", total_rows)
-    return total_rows
-
-
-# ---------------------------------------------------------------------------
-# Transform Phase
-# ---------------------------------------------------------------------------
-
-
-def transform(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-    """Apply Bronze-level validations and column standardization.
-
-    For each DataFrame the function:
-
-    * Validates it is non-empty via :func:`validate_dataframe`.
-    * Uppercases all column names for consistency downstream.
-
-    Args:
-        data (Dict[str, pd.DataFrame]): Raw DataFrames from
-            :func:`extract`.
-
-    Returns:
-        Dict[str, pd.DataFrame]: Validated DataFrames with uppercase
-        column names, keyed by table name.
+        The same dict after validation (columns already uppercased in
+        :func:`extract_small_tables`).
 
     Raises:
         AssertionError: If any DataFrame fails validation.
-
-    Example:
-        >>> transformed = transform({"airlines": df_airlines})
-        >>> list(transformed["airlines"].columns)
-        ['IATA_CODE', 'AIRLINE']
     """
-    logger.info("=" * 80)
-    logger.info("STARTING TRANSFORM PHASE")
-    logger.info("=" * 80)
+    logger.info("=" * 72)
+    logger.info("TRANSFORM — validate schemas")
+    logger.info("=" * 72)
 
-    transformed_data: Dict[str, pd.DataFrame] = {}
-    for table_name, df in data.items():
+    for table, df in data.items():
         try:
-            logger.info("Validating %s...", table_name)  # fix W1203
-            validate_dataframe(df, table_name)
-            df.columns = df.columns.str.upper()
-            logger.info("✓ %s passed validation", table_name)  # fix W1203
-            transformed_data[table_name] = df
+            validate_dataframe(df, table)
         except Exception:
-            logger.exception("Transformation failed for %s", table_name)  # fix W1203
+            logger.exception("Validation failed for %s", table)
             raise
 
-    logger.info("=" * 80)
-    logger.info("TRANSFORM PHASE COMPLETED")
-    logger.info("=" * 80)
-    return transformed_data
+    return data
 
 
-# ---------------------------------------------------------------------------
-# Load Phase
-# ---------------------------------------------------------------------------
+# ── Load ─────────────────────────────────────────────────────────────────────
 
-
-def create_glue_database(database_name: str) -> None:
-    """Create an AWS Glue database if it does not already exist.
-
-    Uses ``awswrangler.catalog.create_database`` with ``exist_ok=True``
-    to guarantee idempotency.
+def create_glue_database(database: str) -> None:
+    """Create an AWS Glue database idempotently.
 
     Args:
-        database_name (str): Name of the Glue database to create.
+        database: Glue database name.
 
     Raises:
-        botocore.exceptions.ClientError: If the AWS API call fails.
-
-    Example:
-        >>> create_glue_database("flights_bronze")
+        botocore.exceptions.ClientError: On AWS API failure.
     """
     try:
-        logger.info("Creating Glue database: %s", database_name)  # fix W1203
         wr.catalog.create_database(
-            name=database_name,
-            description="Bronze layer for flights data",
+            name=database,
+            description="Bronze layer — raw flights data",
             exist_ok=True,
         )
-        logger.info("✓ Glue database '%s' ready", database_name)  # fix W1203
+        logger.info("  ✓ Glue database '%s' ready", database)
     except Exception:
-        logger.exception("Failed to create Glue database")
+        logger.exception("Failed to create Glue database '%s'", database)
         raise
 
 
 def upload_to_s3(
-    df: pd.DataFrame, table_name: str, bucket: str, database: str
+    df: pd.DataFrame,
+    table_name: str,
+    bucket: str,
+    database: str,
 ) -> None:
-    """Upload a DataFrame to S3 as Parquet and register it in Glue.
+    """Write *df* to S3 as Parquet and register it in Glue.
 
-    Writes the data using Snappy compression and ``mode='overwrite'``
-    to ensure idempotent execution.
+    Uses ``mode='overwrite'`` so the operation is **idempotent**.
 
     Args:
-        df (pd.DataFrame): The DataFrame to upload.
-        table_name (str): Logical table name (used for S3 path and
-            Glue table registration).
-        bucket (str): Target S3 bucket name.
-        database (str): Glue database where the table is registered.
+        df: DataFrame to upload.
+        table_name: Logical table name (S3 prefix + Glue table).
+        bucket: S3 bucket name.
+        database: Glue database name.
 
     Raises:
-        botocore.exceptions.ClientError: If the S3/Glue API call fails.
-
-    Example:
-        >>> upload_to_s3(df_flights, "flights", "my-bucket", "flights_bronze")
+        botocore.exceptions.ClientError: On AWS API failure.
     """
+    s3_path = S3_PREFIX_TEMPLATE.format(bucket=bucket, table=table_name)
     try:
-        s3_path = S3_BRONZE_PATH_TEMPLATE.format(bucket=bucket, table=table_name)
-        logger.info("Uploading %s to S3: %s", table_name, s3_path)  # fix W1203
-
         wr.s3.to_parquet(
             df=df,
             path=s3_path,
@@ -402,174 +293,203 @@ def upload_to_s3(
             mode="overwrite",
             compression="snappy",
         )
-
-        row_count = df.shape[0]
-        logger.info("✓ Table '%s' loaded with %d rows", table_name, row_count)  # fix W1203
+        logger.info("  ✓ Tabla %s cargada con %d filas en %s",
+                     table_name, df.shape[0], s3_path)
     except Exception:
-        logger.exception("Failed to upload %s to S3", table_name)  # fix W1203
+        logger.exception("Failed to upload '%s' to %s", table_name, s3_path)
         raise
 
 
-def load(
+def load_small_tables(
     data: Dict[str, pd.DataFrame],
     bucket: str,
-    database: str = GLUE_DATABASE,
+    database: str,
 ) -> None:
-    """Load all DataFrames to S3 and register them in Glue Data Catalog.
-
-    Orchestrates :func:`create_glue_database` followed by
-    :func:`upload_to_s3` for every table in *data*.
+    """Upload airlines and airports to S3 and register in Glue.
 
     Args:
-        data (Dict[str, pd.DataFrame]): Validated DataFrames to load.
-        bucket (str): Target S3 bucket name.
-        database (str, optional): Glue database name.
-            Defaults to :pydata:`GLUE_DATABASE`.
+        data: Validated DataFrames (no flights).
+        bucket: S3 bucket.
+        database: Glue database.
+    """
+    logger.info("=" * 72)
+    logger.info("LOAD — small tables to S3")
+    logger.info("=" * 72)
+
+    for table, df in data.items():
+        upload_to_s3(df, table, bucket, database)
+
+
+def process_flights_chunked(
+    data_dir: str,
+    bucket: str,
+    database: str,
+) -> int:
+    """Read ``flights.csv`` in chunks, validate, and upload to S3.
+
+    Each chunk is uploaded immediately and then freed from memory.
+    The first chunk uses ``mode='overwrite'``; subsequent chunks use
+    ``mode='append'``.  This guarantees idempotency (re-running
+    replaces all previous data).
+
+    Args:
+        data_dir: Directory with ``flights.csv``.
+        bucket: S3 bucket.
+        database: Glue database.
+
+    Returns:
+        Total number of rows processed.
 
     Raises:
-        Exception: Re-raises any exception from sub-functions after
-            logging.
-
-    Example:
-        >>> load({"flights": df, "airlines": df2}, "my-bucket")
+        FileNotFoundError: If the CSV is missing.
+        AssertionError: If a chunk fails validation.
+        botocore.exceptions.ClientError: On AWS failure.
     """
-    logger.info("=" * 80)
-    logger.info("STARTING LOAD PHASE")
-    logger.info("=" * 80)
+    logger.info("=" * 72)
+    logger.info("LOAD — flights (chunked, %d rows/chunk)", CHUNK_SIZE)
+    logger.info("=" * 72)
 
-    try:
-        create_glue_database(database)
+    file_path = os.path.join(data_dir, CSV_FILES["flights"])
+    validate_file(file_path)
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                executor.submit(upload_to_s3, df, name, bucket, database): name
-                for name, df in data.items()
-            }
-            for future in as_completed(futures):
-                future.result()
+    s3_path = S3_PREFIX_TEMPLATE.format(bucket=bucket, table="flights")
+    logger.info("  Source : %s", file_path)
+    logger.info("  Target : %s", s3_path)
 
-        logger.info("=" * 80)
-        logger.info("LOAD PHASE COMPLETED")
-        logger.info("=" * 80)
-    except Exception:  # pylint: disable=broad-exception-caught
-        logger.exception("Load phase failed")
-        raise
+    total_rows = 0
+    reader = pd.read_csv(file_path, engine="c", chunksize=CHUNK_SIZE)
+
+    for i, chunk in enumerate(reader):
+        chunk.columns = chunk.columns.str.upper()
+
+        # Validate every chunk
+        assert not chunk.empty, f"Chunk {i} of flights is empty"
+        for col in REQUIRED_COLUMNS["flights"]:
+            assert col in chunk.columns, (
+                f"Chunk {i}: missing required column '{col}'"
+            )
+
+        mode = "overwrite" if i == 0 else "append"
+        try:
+            wr.s3.to_parquet(
+                df=chunk,
+                path=s3_path,
+                dataset=True,
+                database=database,
+                table="flights",
+                mode=mode,
+                compression="snappy",
+            )
+        except Exception:
+            logger.exception("Failed uploading chunk %d of flights", i)
+            raise
+
+        total_rows += len(chunk)
+        logger.info("  ✓ Chunk %d: %d rows (acumulado: %d)",
+                     i + 1, len(chunk), total_rows)
+        del chunk
+
+    logger.info("  ✓ Tabla flights cargada con %d filas en %s",
+                total_rows, s3_path)
+    return total_rows
 
 
-# ---------------------------------------------------------------------------
-# Pipeline Orchestrator
-# ---------------------------------------------------------------------------
-
+# ── Orchestrator ─────────────────────────────────────────────────────────────
 
 def main(bucket: str, data_dir: str) -> None:
-    """Execute the full Bronze-layer ETL pipeline.
+    """Execute the full Bronze ETL pipeline.
 
-    Sequence: **Extract → Transform → Load**.
+    Sequence::
+
+        1. Validate inputs
+        2. Create Glue database
+        3. Extract + Transform + Load  (airlines, airports)
+        4. Chunked Extract + Load      (flights)
 
     Args:
-        bucket (str): Target S3 bucket name.
-        data_dir (str): Local directory containing the source CSV files.
+        bucket: Target S3 bucket name.
+        data_dir: Local directory with the source CSV files.
 
     Raises:
-        ValueError: If *bucket* or *data_dir* are empty.
-        FileNotFoundError: If *data_dir* does not exist.
-        SystemExit: Exits with code ``1`` on any unhandled error.
-
-    Example:
-        >>> main(bucket="my-bucket", data_dir="data/")
+        SystemExit: Exits with code 1 on any unhandled error.
     """
     try:
-        logger.info("\n╔%s╗", "=" * 78)
-        logger.info("║%sFLIGHTS BRONZE LAYER ETL PIPELINE%s║", " " * 20, " " * 24)
-        logger.info("╚%s╝", "=" * 78)
-        logger.info("Bucket: %s", bucket)          # fix W1203
-        logger.info("Data Directory: %s\n", data_dir)  # fix W1203
+        logger.info("\n%s", "=" * 72)
+        logger.info("  FLIGHTS BRONZE LAYER ETL PIPELINE")
+        logger.info("  Bucket     : %s", bucket)
+        logger.info("  Data dir   : %s", data_dir)
+        logger.info("%s\n", "=" * 72)
 
+        # ── Input validation ─────────────────────────────────────────────
         if not bucket:
-            raise ValueError("Bucket name is required")
+            raise ValueError("--bucket is required")
         if not data_dir:
-            raise ValueError("Data directory is required")
-
-        logger.info("Validating data directory: %s", data_dir)  # fix W1203
+            raise ValueError("--data-dir is required")
         if not os.path.isdir(data_dir):
-            raise FileNotFoundError(f"Data directory not found: {data_dir}")
-        logger.info("✓ Data directory exists\n")
+            raise FileNotFoundError(
+                f"Data directory not found: {data_dir}"
+            )
+        logger.info("✓ Input validation passed\n")
 
-        # --- Small tables (airlines, airports): full in-memory pipeline ---
-        raw_data = extract(data_dir)
-        transformed_data = transform(raw_data)
-        load(transformed_data, bucket)
+        # ── Glue database ────────────────────────────────────────────────
+        create_glue_database(GLUE_DATABASE)
 
-        # --- Flights: chunked read → upload to avoid OOM ---
-        logger.info("=" * 80)
-        logger.info("STARTING CHUNKED FLIGHTS PROCESSING")
-        logger.info("=" * 80)
-        extract_and_load_flights(data_dir, bucket)
+        # ── Small tables: airlines, airports ─────────────────────────────
+        raw_data = extract_small_tables(data_dir)
+        validated_data = transform(raw_data)
+        load_small_tables(validated_data, bucket, GLUE_DATABASE)
 
-        logger.info("\n╔%s╗", "=" * 78)
-        logger.info("║%s✓ BRONZE LAYER COMPLETED%s║", " " * 25, " " * 29)
-        logger.info("╚%s╝\n", "=" * 78)
+        # ── Large table: flights (chunked) ───────────────────────────────
+        process_flights_chunked(data_dir, bucket, GLUE_DATABASE)
+
+        # ── Done ─────────────────────────────────────────────────────────
+        logger.info("\n%s", "=" * 72)
+        logger.info("  ✓ BRONZE LAYER COMPLETED SUCCESSFULLY")
+        logger.info("%s\n", "=" * 72)
 
     except Exception:  # pylint: disable=broad-exception-caught
-        logger.exception("Bronze layer ETL pipeline failed")
+        logger.exception("Bronze ETL pipeline failed")
         sys.exit(1)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
 def parse_arguments() -> argparse.Namespace:
-    """Parse command-line arguments for the Bronze ETL script.
+    """Parse CLI arguments.
 
     Returns:
-        argparse.Namespace: Parsed arguments with ``bucket`` and
-        ``data_dir`` attributes.
-
-    Example:
-        >>> args = parse_arguments()
-        >>> args.bucket
-        'my-bucket'
+        Namespace with ``bucket`` and ``data_dir``.
     """
     parser = argparse.ArgumentParser(
-        description="Bronze Layer ETL - Load raw data to S3 and register in Glue",
+        description="Bronze Layer ETL — raw CSV → S3 Parquet + Glue",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python etl/bronze.py --bucket my-data-bucket --data-dir data/
-  python etl/bronze.py --bucket flights-prod --data-dir /path/to/csv/files/
-        """,
+        epilog=(
+            "Examples:\n"
+            "  python etl/bronze.py --bucket my-bucket "
+            "--data-dir data/flights/\n"
+        ),
     )
-
     parser.add_argument(
-        "--bucket",
-        type=str,
-        required=True,
-        help="AWS S3 bucket name (required)",
+        "--bucket", required=True, help="AWS S3 bucket name",
     )
-
     parser.add_argument(
-        "--data-dir",
-        type=str,
-        required=True,
-        help="Local directory containing CSV files (required)",
+        "--data-dir", required=True,
+        help="Local directory containing CSV files",
     )
-
     return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Entry Point
-# ---------------------------------------------------------------------------
+# ── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     try:
         args = parse_arguments()
         main(bucket=args.bucket, data_dir=args.data_dir)
     except KeyboardInterrupt:
-        logger.warning("Script interrupted by user")
-        sys.exit(1)
-    except Exception:  # pylint: disable=broad-exception-caught  # fix W0718
+        logger.warning("Interrupted by user")
+        sys.exit(130)
+    except SystemExit:
+        raise  # noqa: W0706 — must re-raise to avoid catching sys.exit()
+    except Exception:  # pylint: disable=broad-exception-caught
         logger.exception("Unexpected error")
         sys.exit(1)
