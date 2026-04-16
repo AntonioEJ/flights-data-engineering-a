@@ -34,14 +34,98 @@ El diseño sigue la **arquitectura Medallion** (Bronze → Silver → Gold) sobr
 ## 🏗️ Arquitectura del Proyecto
 
 ### Arquitectura Medallion
-```
-| Capa | Propósito | Formato | Ubicación S3 |
-|---|---|---|---|
-| **Bronze** | Ingestión cruda sin transformaciones. Copia fiel del CSV original. | CSV | `s3://<bucket>/bronze/` |
-| **Silver** | Limpieza, tipado, eliminación de nulos, estandarización de columnas. | Parquet | `s3://<bucket>/silver/` |
-| **Gold** | Agregaciones de negocio: métricas por aerolínea, aeropuerto, rutas y temporalidad. | Parquet | `s3://<bucket>/gold/` |
 
-### Flujo de Datos End-to-End
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          MEDALLION ARCHITECTURE                                 │
+│                                                                                 │
+│  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐                  │
+│  │              │      │              │      │              │                  │
+│  │   🥉 BRONZE  │─────▶│   🥈 SILVER  │─────▶│   🥇 GOLD    │                  │
+│  │              │      │              │      │              │                  │
+│  └──────┬───────┘      └──────┬───────┘      └──────┬───────┘                  │
+│         │                     │                     │                          │
+│    Raw Ingestion         Aggregations          Denormalized                    │
+│    CSV → Parquet         Business KPIs         Analytical Table                │
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │                        AWS SERVICES                                      │   │
+│  │  S3 (Storage)  ·  Glue (Catalog)  ·  Athena (Query)  ·  RDS (RDBMS)    │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 🥉 Bronze — Ingestión Cruda
+
+| Aspecto | Detalle |
+|---|---|
+| **Propósito** | Copia fiel del dataset original sin transformaciones |
+| **Formato** | Parquet (convertido desde CSV) |
+| **Tablas** | `flights` · `airlines` · `airports` |
+| **S3** | `s3://<bucket>/flights/bronze/{tabla}/` |
+| **Glue DB** | `flights_bronze` |
+| **Script** | `etl/bronze.py` |
+
+```
+CSV (local)  ──▶  Validate  ──▶  Parquet (S3)  ──▶  Glue Catalog
+```
+
+#### 🥈 Silver — Agregaciones de Negocio
+
+| Aspecto | Detalle |
+|---|---|
+| **Propósito** | Métricas agregadas por día, mes/aerolínea y aeropuerto |
+| **Formato** | Parquet + Snappy |
+| **S3** | `s3://<bucket>/flights/silver/{tabla}/` |
+| **Glue DB** | `flights_silver` |
+| **Script** | `etl/silver.py` |
+
+| Tabla Silver | Agrupación | Métricas |
+|---|---|---|
+| `flights_daily` | YEAR, MONTH, DAY | total_flights, total_delayed, total_cancelled, avg_departure_delay, avg_arrival_delay |
+| `flights_monthly` | MONTH, AIRLINE | total_flights, total_delayed, total_cancelled, avg_arrival_delay, on_time_pct |
+| `flights_by_airport` | ORIGIN_AIRPORT | total_departures, total_delayed, total_cancelled, avg_departure_delay, pct_weather_delay |
+
+```
+Bronze (S3 Parquet)  ──file-by-file──▶  Partial Aggs  ──combine──▶  Silver (S3 + Glue)
+```
+
+#### 🥇 Gold — Tabla Analítica Desnormalizada
+
+| Aspecto | Detalle |
+|---|---|
+| **Propósito** | Vista desnormalizada lista para consumo analítico |
+| **Método** | CTAS ejecutado en Athena (JOINs sobre Bronze) |
+| **Tabla** | `vuelos_analitica` (~5.8M filas, 20 columnas) |
+| **S3** | `s3://<bucket>/flights/gold/` |
+| **Glue DB** | `flights_gold` |
+| **Script** | `etl/gold.py` |
+
+```
+Bronze tables (Glue)  ──CTAS (Athena)──▶  Gold analytical table (S3 + Glue)
+
+  flights ──┐
+  airlines ─┤── LEFT JOINs ──▶  vuelos_analitica
+  airports ─┘
+```
+
+> **Nota:** El CTAS se construye sobre Bronze para demostrar que Gold puede
+> construirse desde cualquier capa. En producción se construiría desde Silver
+> para aprovechar el Parquet ya procesado.
+
+#### Flujo End-to-End
+
+```
+  download_data.sh          bronze.py              silver.py               gold.py
+  ┌──────────┐        ┌──────────────┐       ┌──────────────┐       ┌──────────────┐
+  │ Download │──CSV──▶│  Ingest Raw  │──S3──▶│  Aggregate   │──S3──▶│  CTAS Join   │
+  │   CSVs   │        │  to Parquet  │       │  KPIs        │       │  Denormalize │
+  └──────────┘        └──────┬───────┘       └──────┬───────┘       └──────┬───────┘
+                             │                      │                      │
+                        Glue: flights_bronze   Glue: flights_silver   Glue: flights_gold
+                        ├─ flights             ├─ flights_daily       └─ vuelos_analitica
+                        ├─ airlines            ├─ flights_monthly
+                        └─ airports            └─ flights_by_airport
 ```
 
 ---
@@ -98,45 +182,39 @@ lights-data-engineering-a/
 
 ## ⚙️ Pipeline ETL
 
-### Bronze — Ingestión (`etl/bronze.py`)
+### Bronze — `etl/bronze.py`
 
-- Lee el archivo CSV original del dataset de vuelos.
-- Lo sube tal cual a `s3://<bucket>/bronze/flights.csv`.
-- No aplica ninguna transformación; preserva el dato crudo.
-- Registra logs de tamaño del archivo y tiempo de carga.
+```bash
+python etl/bronze.py --bucket <tu-bucket> --data-dir data/flights/
+```
 
-### Silver — Transformación y Agregación (`etl/silver.py`)
+- Lee los 3 archivos CSV originales (`flights.csv`, `airlines.csv`, `airports.csv`).
+- Convierte a Parquet y sube a `s3://<bucket>/flights/bronze/{tabla}/`.
+- `flights.csv` (~5.8M filas) se procesa en chunks de 500K filas para evitar OOM.
+- Registra las tablas en Glue Data Catalog (`flights_bronze`).
 
-- Lee los datos de la capa Bronze desde S3 (`s3://<bucket>/flights/bronze/flights/`).
-- Genera **tres tablas agregadas** en formato Parquet + Snappy:
+### Silver — `etl/silver.py`
 
-| Tabla | Group By | Métricas |
-|---|---|---|
-| `flights_daily` | YEAR, MONTH, DAY | total_flights, total_delayed, total_cancelled, avg_departure_delay, avg_arrival_delay |
-| `flights_monthly` | MONTH, AIRLINE | total_flights, total_delayed, total_cancelled, avg_arrival_delay, on_time_pct |
-| `flights_by_airport` | ORIGIN_AIRPORT | total_departures, total_delayed, total_cancelled, avg_departure_delay, pct_weather_delay |
-
-- `flights_daily` se particiona por `MONTH` con `mode="overwrite_partitions"`.
-- Las demás tablas usan `mode="overwrite"` para idempotencia.
-- Todas se registran automáticamente en Glue Data Catalog (`flights_silver`).
-- Escribe logs en `logs/silver_etl.log`.
-
-**Ejecución:**
 ```bash
 python etl/silver.py --bucket <tu-bucket>
 ```
 
-> **Prerequisito:** La capa Bronze debe haberse ejecutado previamente.
+- Lee Bronze archivo por archivo (sin Ray) con solo las columnas necesarias.
+- Computa agregaciones parciales por chunk y las combina al final.
+- Genera 3 tablas Silver: `flights_daily`, `flights_monthly`, `flights_by_airport`.
+- `flights_daily` particionada por `MONTH` (`overwrite_partitions`).
+- Todas registradas en Glue Data Catalog (`flights_silver`).
 
-### Gold — Agregación (`etl/gold.py`)
+### Gold — `etl/gold.py`
 
-- Lee los datos limpios desde la capa Silver.
-- Genera tablas agregadas orientadas al negocio:
-  - **Métricas por aerolínea**: total de vuelos, retrasos promedio, tasa de cancelación.
-  - **Métricas por aeropuerto**: tráfico de origen/destino, retrasos promedio.
-  - **Métricas temporales**: tendencias mensuales, día de la semana.
-  - **Métricas por ruta**: pares origen-destino más frecuentes.
-- Escribe cada tabla en formato **Parquet** en `s3://<bucket>/gold/`.
+```bash
+python etl/gold.py --bucket <tu-bucket>
+```
+
+- Verifica que las tablas Bronze existan en Glue.
+- Ejecuta un CTAS en Athena que une `flights` + `airlines` + `airports`.
+- Genera la tabla desnormalizada `vuelos_analitica` (20 columnas).
+- Valida que `airline_name`, `origin_airport_name` y `destination_airport_name` estén poblados.
 
 ---
 
