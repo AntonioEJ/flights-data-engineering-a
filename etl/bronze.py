@@ -205,15 +205,9 @@ def extract(data_dir: str) -> Dict[str, pd.DataFrame]:
             kwargs = {
                 "filepath_or_buffer": file_path,
                 "engine": "c",
-                "low_memory": False,  # Ensure compatibility with c engine
             }
-            
+
             df = pd.read_csv(**kwargs)
-            
-            # Apply dtype conversions after loading for flights table
-            if table_name == "flights":
-                df = df.astype(FLIGHTS_DTYPES)
-                
             data[table_name] = df
             logger.info(
                 "✓ Read %s: %d rows, %d columns",  # fix W1203
