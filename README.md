@@ -192,7 +192,17 @@ Esta sección debe ser añadida después de la última línea del bloque CloudFo
 Ejecuta los scripts en orden desde el terminal de SageMaker Jupyter Lab:
 
 ```bash
-python etl/bronze.py --bucket <tu-bucket> --data-dir data/
+python etl/bronze.py --bucket <tu-bucket> --data-dir data/flights/
 python etl/silver.py --bucket <tu-bucket>
 python etl/gold.py --bucket <tu-bucket>
-```
+````
+### 3. Crear entorno virtual e instalar dependencias
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # En Linux/Mac
+# .venv\Scripts\activate   # En Windows
+
+pip install --upgrade pip
+pip install -r requirements.txt
+````
