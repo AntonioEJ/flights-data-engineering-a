@@ -30,10 +30,10 @@ import sys
 import os
 import logging
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed  # fix C0411
 from typing import Dict
 import pandas as pd
 import awswrangler as wr
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
 # Module Constants
@@ -94,34 +94,30 @@ FLIGHTS_DTYPES: Dict[str, str] = {
 
 def setup_logging() -> logging.Logger:
     """Configure and return the module-level logger with file and console output."""
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    
-    # Crear directorio de logs si no existe
+    _logger = logging.getLogger(__name__)  # fix W0621: renamed from logger to _logger
+    _logger.setLevel(logging.INFO)
+
     log_dir = "logs"
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
-    
-    # Formato de logs
+
     formatter = logging.Formatter(
         fmt="[%(asctime)s] [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    
-    # Handler para consola
+
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
-    
-    # Handler para archivo
+
     log_file = os.path.join(log_dir, "bronze_etl.log")
     file_handler = logging.FileHandler(log_file)
     file_handler.setFormatter(formatter)
-    
-    if not logger.handlers:
-        logger.addHandler(console_handler)
-        logger.addHandler(file_handler)
-    
-    return logger
+
+    if not _logger.handlers:
+        _logger.addHandler(console_handler)
+        _logger.addHandler(file_handler)
+
+    return _logger
 
 
 logger: logging.Logger = setup_logging()
@@ -203,25 +199,32 @@ def extract(data_dir: str) -> Dict[str, pd.DataFrame]:
     for table_name, filename in CSV_FILES.items():
         file_path = os.path.join(data_dir, filename)
         try:
-            logger.info(f"Reading file: {file_path}")
+            logger.info("Reading file: %s", file_path)  # fix W1203
             validate_file_path(file_path)
 
-            # Use dtype spec for flights (major performance gain)
             kwargs = {
                 "filepath_or_buffer": file_path,
-                "engine": "pyarrow",       # 3-5x faster than default C engine
-                "low_memory": False,
+                "engine": "c",
             }
             if table_name == "flights":
                 kwargs["dtype"] = FLIGHTS_DTYPES
 
+            # Guard: ensure no incompatible options are passed to c engine
+            incompatible_with_c = {"memory_map"}
+            invalid_keys = incompatible_with_c & set(kwargs.keys())
+            if invalid_keys:
+                raise ValueError(
+                    f"Options {invalid_keys} are not supported with engine='c'"
+                )
+
             df = pd.read_csv(**kwargs)
             data[table_name] = df
             logger.info(
-                f"✓ Read {table_name}: {df.shape[0]:,} rows, {df.shape[1]} columns"
+                "✓ Read %s: %d rows, %d columns",  # fix W1203
+                table_name, df.shape[0], df.shape[1]
             )
         except Exception:
-            logger.exception(f"Failed to read {filename}")
+            logger.exception("Failed to read %s", filename)  # fix W1203
             raise
 
     logger.info("=" * 80)
@@ -266,13 +269,13 @@ def transform(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     transformed_data: Dict[str, pd.DataFrame] = {}
     for table_name, df in data.items():
         try:
-            logger.info(f"Validating {table_name}...")
+            logger.info("Validating %s...", table_name)  # fix W1203
             validate_dataframe(df, table_name)
             df.columns = df.columns.str.upper()
-            logger.info(f"✓ {table_name} passed validation")
+            logger.info("✓ %s passed validation", table_name)  # fix W1203
             transformed_data[table_name] = df
         except Exception:
-            logger.exception(f"Transformation failed for {table_name}")
+            logger.exception("Transformation failed for %s", table_name)  # fix W1203
             raise
 
     logger.info("=" * 80)
@@ -302,13 +305,13 @@ def create_glue_database(database_name: str) -> None:
         >>> create_glue_database("flights_bronze")
     """
     try:
-        logger.info(f"Creating Glue database: {database_name}")
+        logger.info("Creating Glue database: %s", database_name)  # fix W1203
         wr.catalog.create_database(
             name=database_name,
             description="Bronze layer for flights data",
             exist_ok=True,
         )
-        logger.info(f"✓ Glue database '{database_name}' ready")
+        logger.info("✓ Glue database '%s' ready", database_name)  # fix W1203
     except Exception:
         logger.exception("Failed to create Glue database")
         raise
@@ -337,7 +340,7 @@ def upload_to_s3(
     """
     try:
         s3_path = S3_BRONZE_PATH_TEMPLATE.format(bucket=bucket, table=table_name)
-        logger.info(f"Uploading {table_name} to S3: {s3_path}")
+        logger.info("Uploading %s to S3: %s", table_name, s3_path)  # fix W1203
 
         wr.s3.to_parquet(
             df=df,
@@ -350,9 +353,9 @@ def upload_to_s3(
         )
 
         row_count = df.shape[0]
-        logger.info(f"✓ Table '{table_name}' loaded with {row_count:,} rows")
+        logger.info("✓ Table '%s' loaded with %d rows", table_name, row_count)  # fix W1203
     except Exception:
-        logger.exception(f"Failed to upload {table_name} to S3")
+        logger.exception("Failed to upload %s to S3", table_name)  # fix W1203
         raise
 
 
@@ -386,7 +389,6 @@ def load(
     try:
         create_glue_database(database)
 
-        # Upload airlines and airports in parallel (small tables)
         small_tables = {k: v for k, v in data.items() if k != "flights"}
         large_tables = {k: v for k, v in data.items() if k == "flights"}
 
@@ -396,16 +398,15 @@ def load(
                 for name, df in small_tables.items()
             }
             for future in as_completed(futures):
-                future.result()  # raises if failed
+                future.result()
 
-        # Upload flights separately (large file, sequential)
         for table_name, df in large_tables.items():
             upload_to_s3(df, table_name, bucket, database)
 
         logger.info("=" * 80)
         logger.info("LOAD PHASE COMPLETED")
         logger.info("=" * 80)
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         logger.exception("Load phase failed")
         raise
 
@@ -438,15 +439,15 @@ def main(bucket: str, data_dir: str) -> None:
             "║" + " " * 20 + "FLIGHTS BRONZE LAYER ETL PIPELINE" + " " * 24 + "║"
         )
         logger.info("╚" + "=" * 78 + "╝")
-        logger.info(f"Bucket: {bucket}")
-        logger.info(f"Data Directory: {data_dir}\n")
+        logger.info("Bucket: %s", bucket)          # fix W1203
+        logger.info("Data Directory: %s\n", data_dir)  # fix W1203
 
         if not bucket:
             raise ValueError("Bucket name is required")
         if not data_dir:
             raise ValueError("Data directory is required")
 
-        logger.info(f"Validating data directory: {data_dir}")
+        logger.info("Validating data directory: %s", data_dir)  # fix W1203
         if not os.path.isdir(data_dir):
             raise FileNotFoundError(f"Data directory not found: {data_dir}")
         logger.info("✓ Data directory exists\n")
@@ -461,7 +462,7 @@ def main(bucket: str, data_dir: str) -> None:
         )
         logger.info("╚" + "=" * 78 + "╝\n")
 
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         logger.exception("Bronze layer ETL pipeline failed")
         sys.exit(1)
 
@@ -521,6 +522,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.warning("Script interrupted by user")
         sys.exit(1)
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught  # fix W0718
         logger.exception("Unexpected error")
         sys.exit(1)
