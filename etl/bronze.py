@@ -33,6 +33,7 @@ import argparse
 from typing import Dict
 import pandas as pd
 import awswrangler as wr
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
 # Module Constants
@@ -51,35 +52,75 @@ GLUE_DATABASE: str = "flights_bronze"
 S3_BRONZE_PATH_TEMPLATE: str = "s3://{bucket}/flights/bronze/{table}/"
 """str: S3 URI template. Placeholders: ``{bucket}`` and ``{table}``."""
 
+FLIGHTS_DTYPES: Dict[str, str] = {
+    "YEAR": "Int16",
+    "MONTH": "Int8",
+    "DAY": "Int8",
+    "DAY_OF_WEEK": "Int8",
+    "AIRLINE": "category",
+    "FLIGHT_NUMBER": "Int32",
+    "TAIL_NUMBER": "str",
+    "ORIGIN_AIRPORT": "category",
+    "DESTINATION_AIRPORT": "category",
+    "SCHEDULED_DEPARTURE": "Int32",
+    "DEPARTURE_TIME": "float32",
+    "DEPARTURE_DELAY": "float32",
+    "TAXI_OUT": "float32",
+    "WHEELS_OFF": "float32",
+    "SCHEDULED_TIME": "float32",
+    "ELAPSED_TIME": "float32",
+    "AIR_TIME": "float32",
+    "DISTANCE": "float32",
+    "WHEELS_ON": "float32",
+    "TAXI_IN": "float32",
+    "SCHEDULED_ARRIVAL": "Int32",
+    "ARRIVAL_TIME": "float32",
+    "ARRIVAL_DELAY": "float32",
+    "DIVERTED": "Int8",
+    "CANCELLED": "Int8",
+    "CANCELLATION_REASON": "category",
+    "AIR_SYSTEM_DELAY": "float32",
+    "SECURITY_DELAY": "float32",
+    "AIRLINE_DELAY": "float32",
+    "LATE_AIRCRAFT_DELAY": "float32",
+    "WEATHER_DELAY": "float32",
+}
+"""dict: Data types for the flights table."""
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
 
 def setup_logging() -> logging.Logger:
-    """Configure and return the module-level logger.
-
-    Creates a ``StreamHandler`` with a timestamped format so every log
-    line includes date-time, level, and message.
-
-    Returns:
-        logging.Logger: Configured logger instance for the module.
-
-    Example:
-        >>> logger = setup_logging()
-        >>> logger.info("Pipeline started")
-        [2026-04-15 10:00:00] [INFO] Pipeline started
-    """
+    """Configure and return the module-level logger with file and console output."""
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
+    
+    # Crear directorio de logs si no existe
+    log_dir = "logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    # Formato de logs
     formatter = logging.Formatter(
         fmt="[%(asctime)s] [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    handler.setFormatter(formatter)
+    
+    # Handler para consola
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    
+    # Handler para archivo
+    log_file = os.path.join(log_dir, "bronze_etl.log")
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
+    
     if not logger.handlers:
-        logger.addHandler(handler)
+        logger.addHandler(console_handler)
+        logger.addHandler(file_handler)
+    
     return logger
 
 
@@ -164,7 +205,17 @@ def extract(data_dir: str) -> Dict[str, pd.DataFrame]:
         try:
             logger.info(f"Reading file: {file_path}")
             validate_file_path(file_path)
-            df = pd.read_csv(file_path)
+
+            # Use dtype spec for flights (major performance gain)
+            kwargs = {
+                "filepath_or_buffer": file_path,
+                "engine": "pyarrow",       # 3-5x faster than default C engine
+                "low_memory": False,
+            }
+            if table_name == "flights":
+                kwargs["dtype"] = FLIGHTS_DTYPES
+
+            df = pd.read_csv(**kwargs)
             data[table_name] = df
             logger.info(
                 f"✓ Read {table_name}: {df.shape[0]:,} rows, {df.shape[1]} columns"
@@ -334,8 +385,23 @@ def load(
 
     try:
         create_glue_database(database)
-        for table_name, df in data.items():
+
+        # Upload airlines and airports in parallel (small tables)
+        small_tables = {k: v for k, v in data.items() if k != "flights"}
+        large_tables = {k: v for k, v in data.items() if k == "flights"}
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                executor.submit(upload_to_s3, df, name, bucket, database): name
+                for name, df in small_tables.items()
+            }
+            for future in as_completed(futures):
+                future.result()  # raises if failed
+
+        # Upload flights separately (large file, sequential)
+        for table_name, df in large_tables.items():
             upload_to_s3(df, table_name, bucket, database)
+
         logger.info("=" * 80)
         logger.info("LOAD PHASE COMPLETED")
         logger.info("=" * 80)
