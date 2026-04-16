@@ -105,15 +105,28 @@ lights-data-engineering-a/
 - No aplica ninguna transformación; preserva el dato crudo.
 - Registra logs de tamaño del archivo y tiempo de carga.
 
-### Silver — Transformación (`etl/silver.py`)
+### Silver — Transformación y Agregación (`etl/silver.py`)
 
-- Lee el CSV desde la capa Bronze en S3.
-- Aplica las siguientes transformaciones:
-  - Eliminación de filas con valores nulos críticos.
-  - Conversión de tipos de dato (fechas, enteros, flotantes).
-  - Estandarización de nombres de columnas (`snake_case`).
-  - Eliminación de columnas redundantes o sin valor analítico.
-- Escribe el resultado en formato **Parquet** en `s3://<bucket>/silver/flights.parquet`.
+- Lee los datos de la capa Bronze desde S3 (`s3://<bucket>/flights/bronze/flights/`).
+- Genera **tres tablas agregadas** en formato Parquet + Snappy:
+
+| Tabla | Group By | Métricas |
+|---|---|---|
+| `flights_daily` | YEAR, MONTH, DAY | total_flights, total_delayed, total_cancelled, avg_departure_delay, avg_arrival_delay |
+| `flights_monthly` | MONTH, AIRLINE | total_flights, total_delayed, total_cancelled, avg_arrival_delay, on_time_pct |
+| `flights_by_airport` | ORIGIN_AIRPORT | total_departures, total_delayed, total_cancelled, avg_departure_delay, pct_weather_delay |
+
+- `flights_daily` se particiona por `MONTH` con `mode="overwrite_partitions"`.
+- Las demás tablas usan `mode="overwrite"` para idempotencia.
+- Todas se registran automáticamente en Glue Data Catalog (`flights_silver`).
+- Escribe logs en `logs/silver_etl.log`.
+
+**Ejecución:**
+```bash
+python etl/silver.py --bucket <tu-bucket>
+```
+
+> **Prerequisito:** La capa Bronze debe haberse ejecutado previamente.
 
 ### Gold — Agregación (`etl/gold.py`)
 
