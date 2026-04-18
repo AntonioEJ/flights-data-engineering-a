@@ -196,6 +196,7 @@ flights-data-engineering-a/
 ├── docs/                   → Diagrama ER y documentación técnica
 │   ├── erd-flights.drawio
 │   ├── erd-flights.png
+│   ├── html/               → Documentación de docstrings (pdoc)
 │   └── screenshots/        → Evidencia de queries P1–P5, W1–W3 y regresión
 ├── etl/                    → Pipeline Medallion (Bronze → Silver → Gold)
 │   ├── bronze.py
