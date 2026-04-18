@@ -306,10 +306,6 @@ El notebook conecta a las tres capas del pipeline (Bronze vía RDS, Silver y Gol
 - **Fuente de datos:** `flights_gold.vuelos_analitica` (muestra de 100K filas)
 - **Librería:** `statsmodels.OLS`
 
-| Métrica | Valor |
-|---|---|
-| $R^2$ | 1.0000 |
-| RMSE | ≈ 0.0000 min |
 
 **Visualizaciones de diagnóstico:**
 
